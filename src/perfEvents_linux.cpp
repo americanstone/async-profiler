@@ -1,17 +1,6 @@
 /*
- * Copyright 2017 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifdef __linux__
@@ -25,23 +14,23 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include "arch.h"
+#include "fdtransferClient.h"
 #include "j9StackTraces.h"
 #include "log.h"
-#include "os.h"
 #include "perfEvents.h"
-#include "fdtransferClient.h"
 #include "profiler.h"
 #include "spinLock.h"
 #include "stackFrame.h"
 #include "stackWalker.h"
 #include "symbols.h"
+#include "tsc.h"
 #include "vmStructs.h"
 
 
@@ -79,10 +68,11 @@ static int fetchInt(const char* file_name) {
 }
 
 // Get perf_event_attr.config numeric value of the given tracepoint name
-// by reading /sys/kernel/debug/tracing/events/<name>/id file
-static int findTracepointId(const char* name) {
+// by reading /sys/kernel/tracing/events/<name>/id (since 4.1)
+// or /sys/kernel/debug/tracing/events/<name>/id (before 4.1)
+static int findTracepointId(const char* dir, const char* name) {
     char buf[256];
-    if ((size_t)snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%s/id", name) >= sizeof(buf)) {
+    if ((size_t)snprintf(buf, sizeof(buf), "/sys/kernel/%s/events/%s/id", dir, name) >= sizeof(buf)) {
         return 0;
     }
 
@@ -150,43 +140,14 @@ static bool setPmuConfig(const char* device, const char* param, __u64* config, _
     return false;
 }
 
-
-static void** _pthread_entry = NULL;
-
-// Intercept thread creation/termination by patching libjvm's GOT entry for pthread_setspecific().
-// HotSpot puts VMThread into TLS on thread start, and resets on thread end.
-static int pthread_setspecific_hook(pthread_key_t key, const void* value) {
-    if (key != VMThread::key()) {
-        return pthread_setspecific(key, value);
+// Perf events consume one file descriptor per thread.
+// Make sure the current limit is the highest possible.
+static void adjustFDLimit() {
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0 && rlim.rlim_cur < rlim.rlim_max) {
+        rlim.rlim_cur = rlim.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rlim);
     }
-    if (pthread_getspecific(key) == value) {
-        return 0;
-    }
-
-    if (value != NULL) {
-        int result = pthread_setspecific(key, value);
-        PerfEvents::createForThread(OS::threadId());
-        return result;
-    } else {
-        PerfEvents::destroyForThread(OS::threadId());
-        return pthread_setspecific(key, value);
-    }
-}
-
-static void** lookupThreadEntry() {
-    // Depending on Zing version, pthread_setspecific is called either from libazsys.so or from libjvm.so
-    if (VM::isZing()) {
-        CodeCache* libazsys = Profiler::instance()->findLibraryByName("libazsys");
-        if (libazsys != NULL) {
-            void** entry = libazsys->findGlobalOffsetEntry((void*)&pthread_setspecific);
-            if (entry != NULL) {
-                return entry;
-            }
-        }
-    }
-
-    CodeCache* lib = Profiler::instance()->findJvmLibrary("libj9thr");
-    return lib != NULL ? lib->findGlobalOffsetEntry((void*)&pthread_setspecific) : NULL;
 }
 
 
@@ -205,6 +166,7 @@ struct PerfEventType {
     int counter_arg;
 
     enum {
+        IDX_CPU = 0,
         IDX_PREDEFINED = 12,
         IDX_RAW,
         IDX_PMU,
@@ -246,9 +208,11 @@ struct PerfEventType {
 
         // Parse access type [:rwx]
         c = strrchr(buf, ':');
-        if (c != NULL && c != name && c[-1] != ':') {
+        if (c != NULL && c != buf && c[-1] != ':') {
             *c++ = 0;
-            if (strcmp(c, "r") == 0) {
+            if (strcmp(c, "rw") == 0 || strcmp(c, "wr") == 0) {
+                bp_type = HW_BREAKPOINT_RW;
+            } else if (strcmp(c, "r") == 0) {
                 bp_type = HW_BREAKPOINT_R;
             } else if (strcmp(c, "w") == 0) {
                 bp_type = HW_BREAKPOINT_W;
@@ -256,7 +220,7 @@ struct PerfEventType {
                 bp_type = HW_BREAKPOINT_X;
                 bp_len = sizeof(long);
             } else {
-                bp_type = HW_BREAKPOINT_RW;
+                return NULL;
             }
         }
 
@@ -279,6 +243,9 @@ struct PerfEventType {
         __u64 addr;
         if (strncmp(buf, "0x", 2) == 0) {
             addr = (__u64)strtoll(buf, NULL, 0);
+        } else if (buf[0] >= '0' && buf[0] <= '9') {
+            // Only hex address is supported.
+            return NULL;
         } else {
             addr = (__u64)(uintptr_t)dlsym(RTLD_DEFAULT, buf);
             if (addr == 0) {
@@ -311,6 +278,10 @@ struct PerfEventType {
     static PerfEventType* getProbe(PerfEventType* probe, const char* type, const char* name, __u64 ret) {
         strncpy(probe_func, name, sizeof(probe_func) - 1);
         probe_func[sizeof(probe_func) - 1] = 0;
+
+        if (probe_func[0] == 0) {
+            return NULL;
+        }
 
         if (probe->type == 0 && (probe->type = findDeviceType(type)) == 0) {
             return NULL;
@@ -394,8 +365,13 @@ struct PerfEventType {
     }
 
     static PerfEventType* forName(const char* name) {
+        // "cpu" is an alias for "cpu-clock"
+        if (strcmp(name, EVENT_CPU) == 0) {
+            return &AVAILABLE_EVENTS[IDX_CPU];
+        }
+
         // Look through the table of predefined perf events
-        for (int i = 0; i < IDX_PREDEFINED; i++) {
+        for (int i = 0; i <= IDX_PREDEFINED; i++) {
             if (strcmp(name, AVAILABLE_EVENTS[i].name) == 0) {
                 return &AVAILABLE_EVENTS[i];
             }
@@ -444,8 +420,9 @@ struct PerfEventType {
         // Kernel tracepoints defined in debugfs
         s = strchr(name, ':');
         if (s != NULL && s[1] != ':') {
-            int tracepoint_id = findTracepointId(name);
-            if (tracepoint_id > 0) {
+            int tracepoint_id;
+            if ((tracepoint_id = findTracepointId("tracing", name)) > 0 ||
+                (tracepoint_id = findTracepointId("debug/tracing", name)) > 0) {
                 return getTracepoint(tracepoint_id);
             }
         }
@@ -459,10 +436,17 @@ struct PerfEventType {
 #define LOAD_MISS(perf_hw_cache_id) \
     ((perf_hw_cache_id) | PERF_COUNT_HW_CACHE_OP_READ << 8 | PERF_COUNT_HW_CACHE_RESULT_MISS << 16)
 
+// Hardware breakpoint with interval=1 causes an infinite loop on ARM64
+#ifdef __aarch64__
+#  define BKPT_INTERVAL 2
+#else
+#  define BKPT_INTERVAL 1
+#endif
+
 PerfEventType PerfEventType::AVAILABLE_EVENTS[] = {
-    {"cpu",          DEFAULT_INTERVAL, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK},
+    {"cpu-clock",    DEFAULT_INTERVAL, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK},
     {"page-faults",                 1, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS},
-    {"context-switches",            1, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
+    {"context-switches",            2, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
 
     {"cycles",                1000000, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
     {"instructions",          1000000, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
@@ -476,10 +460,12 @@ PerfEventType PerfEventType::AVAILABLE_EVENTS[] = {
     {"LLC-load-misses",          1000, PERF_TYPE_HW_CACHE, LOAD_MISS(PERF_COUNT_HW_CACHE_LL)},
     {"dTLB-load-misses",         1000, PERF_TYPE_HW_CACHE, LOAD_MISS(PERF_COUNT_HW_CACHE_DTLB)},
 
+    /* End of IDX_PREDEFINED events */
+
     {"rNNN",                     1000, PERF_TYPE_RAW, 0}, /* IDX_RAW */
     {"pmu/event-descriptor/",    1000, PERF_TYPE_RAW, 0}, /* IDX_PMU */
 
-    {"mem:breakpoint",              1, PERF_TYPE_BREAKPOINT, 0}, /* IDX_BREAKPOINT */
+    {"mem:breakpoint",  BKPT_INTERVAL, PERF_TYPE_BREAKPOINT, 0}, /* IDX_BREAKPOINT */
     {"trace:tracepoint",            1, PERF_TYPE_TRACEPOINT, 0}, /* IDX_TRACEPOINT */
 
     {"kprobe:func",                 1, 0, 0}, /* IDX_KPROBE */
@@ -541,19 +527,12 @@ class PerfEvent : public SpinLock {
 int PerfEvents::_max_events = 0;
 PerfEvent* PerfEvents::_events = NULL;
 PerfEventType* PerfEvents::_event_type = NULL;
-long PerfEvents::_interval;
-Ring PerfEvents::_ring;
-CStack PerfEvents::_cstack;
-bool PerfEvents::_use_mmap_page;
+bool PerfEvents::_alluser;
+bool PerfEvents::_kernel_stack;
 
 int PerfEvents::createForThread(int tid) {
     if (tid >= _max_events) {
         Log::warn("tid[%d] > pid_max[%d]. Restart profiler after changing pid_max", tid, _max_events);
-        return -1;
-    }
-
-    PerfEventType* event_type = _event_type;
-    if (event_type == NULL) {
         return -1;
     }
 
@@ -563,6 +542,7 @@ int PerfEvents::createForThread(int tid) {
         return -1;
     }
 
+    PerfEventType* event_type = _event_type;
     struct perf_event_attr attr = {0};
     attr.size = sizeof(attr);
     attr.type = event_type->type;
@@ -585,13 +565,15 @@ int PerfEvents::createForThread(int tid) {
     attr.disabled = 1;
     attr.wakeup_events = 1;
 
-    if (_ring == RING_USER) {
+    if (_alluser) {
         attr.exclude_kernel = 1;
-    } else if (_ring == RING_KERNEL) {
-        attr.exclude_user = 1;
     }
 
-    if (_cstack == CSTACK_FP || _cstack == CSTACK_DWARF) {
+    if (!_kernel_stack) {
+        attr.exclude_callchain_kernel = 1;
+    }
+
+    if (_cstack >= CSTACK_FP) {
         attr.exclude_callchain_user = 1;
     }
 
@@ -600,7 +582,6 @@ int PerfEvents::createForThread(int tid) {
         attr.sample_type |= PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER;
         attr.branch_sample_type = PERF_SAMPLE_BRANCH_USER | PERF_SAMPLE_BRANCH_CALL_STACK;
         attr.sample_regs_user = 1ULL << PERF_REG_PC;
-        attr.exclude_callchain_user = 1;
     }
 #else
 #warning "Compiling without LBR support. Kernel headers 4.1+ required"
@@ -617,13 +598,20 @@ int PerfEvents::createForThread(int tid) {
         int err = errno;
         Log::warn("perf_event_open for TID %d failed: %s", tid, strerror(err));
         _events[tid]._fd = 0;
+        if (isResourceLimit(err) && _current != NULL) {
+            // Emergency shutdown
+            stop();
+        }
         return err;
     }
 
-    void* page = _use_mmap_page ? mmap(NULL, 2 * OS::page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : NULL;
-    if (page == MAP_FAILED) {
-        Log::warn("perf_event mmap failed: %s", strerror(errno));
-        page = NULL;
+    void* page = NULL;
+    if (_kernel_stack || _cstack == CSTACK_DEFAULT || _cstack == CSTACK_LBR) {
+        page = mmap(NULL, 2 * OS::page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (page == MAP_FAILED) {
+            Log::warn("perf_event mmap failed: %s", strerror(errno));
+            page = NULL;
+        }
     }
 
     _events[tid].reset();
@@ -635,7 +623,7 @@ int PerfEvents::createForThread(int tid) {
     ex.pid = tid;
 
     int err;
-    if (fcntl(fd, F_SETFL, O_ASYNC) < 0 || fcntl(fd, F_SETSIG, SIGPROF) < 0 || fcntl(fd, F_SETOWN_EX, &ex) < 0) {
+    if (fcntl(fd, F_SETFL, O_ASYNC) < 0 || fcntl(fd, F_SETSIG, _signal) < 0 || fcntl(fd, F_SETOWN_EX, &ex) < 0) {
         err = errno;
         Log::warn("perf_event fcntl failed: %s", strerror(err));
     } else if (ioctl(fd, PERF_EVENT_IOC_RESET, 0) < 0 || ioctl(fd, PERF_EVENT_IOC_REFRESH, 1) < 0) {
@@ -695,9 +683,9 @@ void PerfEvents::signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     }
 
     if (_enabled) {
+        ExecutionEvent event(TSC::ticks());
         u64 counter = readCounter(siginfo, ucontext);
-        ExecutionEvent event;
-        Profiler::instance()->recordSample(ucontext, counter, 0, &event);
+        Profiler::instance()->recordSample(ucontext, counter, PERF_SAMPLE, &event);
     } else {
         resetBuffer(OS::threadId());
     }
@@ -727,7 +715,7 @@ void PerfEvents::signalHandlerJ9(int signo, siginfo_t* siginfo, void* ucontext) 
 }
 
 const char* PerfEvents::title() {
-    if (_event_type == NULL || _event_type->name == EVENT_CPU) {
+    if (_event_type == NULL || strcmp(_event_type->name, "cpu-clock") == 0) {
         return "CPU profile";
     } else if (_event_type->type == PERF_TYPE_SOFTWARE || _event_type->type == PERF_TYPE_HARDWARE || _event_type->type == PERF_TYPE_HW_CACHE) {
         return _event_type->name;
@@ -737,7 +725,7 @@ const char* PerfEvents::title() {
 }
 
 const char* PerfEvents::units() {
-    return _event_type == NULL || _event_type->name == EVENT_CPU ? "ns" : "total";
+    return _event_type == NULL || strcmp(_event_type->name, "cpu-clock") == 0 ? "ns" : "total";
 }
 
 Error PerfEvents::check(Arguments& args) {
@@ -748,7 +736,7 @@ Error PerfEvents::check(Arguments& args) {
         return Error("Only arguments 1-4 can be counted");
     }
 
-    if (_pthread_entry == NULL && (_pthread_entry = lookupThreadEntry()) == NULL) {
+    if (!setupThreadHook()) {
         return Error("Could not set pthread hook");
     }
 
@@ -768,17 +756,8 @@ Error PerfEvents::check(Arguments& args) {
     attr.sample_type = PERF_SAMPLE_CALLCHAIN;
     attr.disabled = 1;
 
-    if (args._ring == RING_USER) {
+    if (args._alluser) {
         attr.exclude_kernel = 1;
-    } else if (args._ring == RING_KERNEL) {
-        attr.exclude_user = 1;
-    } else if (!Symbols::haveKernelSymbols()) {
-        Profiler::instance()->updateSymbols(true);
-        attr.exclude_kernel = Symbols::haveKernelSymbols() ? 0 : 1;
-    }
-
-    if (_cstack == CSTACK_FP || _cstack == CSTACK_DWARF) {
-        attr.exclude_callchain_user = 1;
     }
 
 #ifdef PERF_ATTR_SIZE_VER5
@@ -786,7 +765,6 @@ Error PerfEvents::check(Arguments& args) {
         attr.sample_type |= PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER;
         attr.branch_sample_type = PERF_SAMPLE_BRANCH_USER | PERF_SAMPLE_BRANCH_CALL_STACK;
         attr.sample_regs_user = 1ULL << PERF_REG_PC;
-        attr.exclude_callchain_user = 1;
     }
 #endif
 
@@ -807,7 +785,7 @@ Error PerfEvents::start(Arguments& args) {
         return Error("Only arguments 1-4 can be counted");
     }
 
-    if (_pthread_entry == NULL && (_pthread_entry = lookupThreadEntry()) == NULL) {
+    if (!setupThreadHook()) {
         return Error("Could not set pthread hook");
     }
 
@@ -815,16 +793,22 @@ Error PerfEvents::start(Arguments& args) {
         return Error("interval must be positive");
     }
     _interval = args._interval ? args._interval : _event_type->default_interval;
+    _cstack = args._cstack;
+    _signal = args._signal == 0 ? OS::getProfilingSignal(0) : args._signal & 0xff;
+    _count_overrun = false;
 
-    _ring = args._ring;
-    if (_ring != RING_USER && !Symbols::haveKernelSymbols()) {
+    _alluser = args._alluser;
+    _kernel_stack = !_alluser && _cstack != CSTACK_NO;
+    if (_kernel_stack && !Symbols::haveKernelSymbols()) {
         Log::warn("Kernel symbols are unavailable due to restrictions. Try\n"
                   "  sysctl kernel.perf_event_paranoid=1\n"
                   "  sysctl kernel.kptr_restrict=0");
-        _ring = RING_USER;
+        _kernel_stack = false;
+        // Automatically switch on alluser for non-CPU events, if kernel profiling is unavailable
+        _alluser = strcmp(args._event, EVENT_CPU) != 0 && !supported();
     }
-    _cstack = args._cstack;
-    _use_mmap_page = _cstack != CSTACK_NO && (_ring != RING_USER || _cstack == CSTACK_DEFAULT || _cstack == CSTACK_LBR);
+
+    adjustFDLimit();
 
     int max_events = OS::getMaxThreadId();
     if (max_events != _max_events) {
@@ -834,35 +818,26 @@ Error PerfEvents::start(Arguments& args) {
     }
 
     if (VM::isOpenJ9()) {
-        if (_cstack == CSTACK_DEFAULT) _cstack = CSTACK_DWARF;
-        OS::installSignalHandler(SIGPROF, signalHandlerJ9);
+        OS::installSignalHandler(_signal, signalHandlerJ9);
         Error error = J9StackTraces::start(args);
         if (error) {
             return error;
         }
     } else {
-        OS::installSignalHandler(SIGPROF, signalHandler);
+        OS::installSignalHandler(_signal, signalHandler);
     }
 
     // Enable pthread hook before traversing currently running threads
-    __atomic_store_n(_pthread_entry, (void*)pthread_setspecific_hook, __ATOMIC_RELEASE);
+    enableThreadHook();
 
     // Create perf_events for all existing threads
-    int err;
-    bool created = false;
-    ThreadList* thread_list = OS::listThreads();
-    for (int tid; (tid = thread_list->next()) != -1; ) {
-        if ((err = createForThread(tid)) == 0) {
-            created = true;
-        }
-    }
-    delete thread_list;
-
-    if (!created) {
-        __atomic_store_n(_pthread_entry, (void*)pthread_setspecific, __ATOMIC_RELEASE);
-        J9StackTraces::stop();
+    int err = createForAllThreads();
+    if (err) {
+        stop();
         if (err == EACCES || err == EPERM) {
-            return Error("No access to perf events. Try --fdtransfer or --all-user option or 'sysctl kernel.perf_event_paranoid=1'");
+            return Error("Perf events unavailable. Try --fdtransfer or --all-user option or 'sysctl kernel.perf_event_paranoid=1'");
+        } else if (isResourceLimit(err)) {
+            return Error("Perf events resource limit. Check 'ulimit -n'");
         } else {
             return Error("Perf events unavailable");
         }
@@ -871,7 +846,7 @@ Error PerfEvents::start(Arguments& args) {
 }
 
 void PerfEvents::stop() {
-    __atomic_store_n(_pthread_entry, (void*)pthread_setspecific, __ATOMIC_RELEASE);
+    disableThreadHook();
     for (int i = 0; i < _max_events; i++) {
         destroyForThread(i);
     }
@@ -977,11 +952,24 @@ void PerfEvents::resetBuffer(int tid) {
     event->unlock();
 }
 
+// This function determines engine selection for CPU profiling.
+// Returns true if perf_events AND kernel measurements are available.
 bool PerfEvents::supported() {
-    // The official way of knowing if perf_event_open() support is enabled
-    // is checking for the existence of the file /proc/sys/kernel/perf_event_paranoid
-    struct stat statbuf;
-    return stat("/proc/sys/kernel/perf_event_paranoid", &statbuf) == 0;
+    struct perf_event_attr attr = {0};
+    attr.size = sizeof(attr);
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.config = PERF_COUNT_SW_CPU_CLOCK;
+    attr.sample_period = 1000000000;
+    attr.sample_type = PERF_SAMPLE_CALLCHAIN;
+    attr.disabled = 1;
+
+    int fd = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd == -1) {
+        return false;
+    }
+
+    close(fd);
+    return true;
 }
 
 const char* PerfEvents::getEventName(int event_id) {

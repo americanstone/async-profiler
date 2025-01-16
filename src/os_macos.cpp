@@ -1,17 +1,6 @@
 /*
- * Copyright 2018 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifdef __APPLE__
@@ -36,14 +25,14 @@ class MacThreadList : public ThreadList {
   private:
     task_t _task;
     thread_array_t _thread_array;
-    unsigned int _thread_count;
-    unsigned int _thread_index;
 
-    void ensureThreadArray() {
-        if (_thread_array == NULL) {
-            _thread_count = 0;
-            _thread_index = 0;
-            task_threads(_task, &_thread_array, &_thread_count);
+    void deallocate() {
+        if (_thread_array != NULL) {
+            for (u32 i = 0; i < _count; i++) {
+                mach_port_deallocate(_task, _thread_array[i]);
+            }
+            vm_deallocate(_task, (vm_address_t)_thread_array, _count * sizeof(thread_t));
+            _thread_array = NULL;
         }
     }
 
@@ -51,33 +40,21 @@ class MacThreadList : public ThreadList {
     MacThreadList() {
         _task = mach_task_self();
         _thread_array = NULL;
+        task_threads(_task, &_thread_array, &_count);
     }
 
     ~MacThreadList() {
-        rewind();
-    }
-
-    void rewind() {
-        if (_thread_array != NULL) {
-            for (int i = 0; i < _thread_count; i++) {
-                mach_port_deallocate(_task, _thread_array[i]);
-            }
-            vm_deallocate(_task, (vm_address_t)_thread_array, _thread_count * sizeof(thread_t));
-            _thread_array = NULL;
-        }
+        deallocate();
     }
 
     int next() {
-        ensureThreadArray();
-        if (_thread_index < _thread_count) {
-            return (int)_thread_array[_thread_index++];
-        }
-        return -1;
+        return (int)_thread_array[_index++];
     }
 
-    int size() {
-        ensureThreadArray();
-        return _thread_count;
+    void update() {
+        deallocate();
+        _index = _count = 0;
+        task_threads(_task, &_thread_array, &_count);
     }
 };
 
@@ -115,6 +92,8 @@ JitWriteProtection::~JitWriteProtection() {
 }
 
 
+static SigAction installed_sigaction[32];
+
 const size_t OS::page_size = sysconf(_SC_PAGESIZE);
 const size_t OS::page_mask = OS::page_size - 1;
 
@@ -136,6 +115,10 @@ u64 OS::micros() {
 void OS::sleep(u64 nanos) {
     struct timespec ts = {(time_t)(nanos / 1000000000), (long)(nanos % 1000000000)};
     nanosleep(&ts, NULL);
+}
+
+u64 OS::overrun(siginfo_t* siginfo) {
+    return 0;
 }
 
 u64 OS::processStartTime() {
@@ -191,9 +174,21 @@ ThreadState OS::threadState(int thread_id) {
     struct thread_basic_info info;
     mach_msg_type_number_t size = sizeof(info);
     if (thread_info((thread_act_t)thread_id, THREAD_BASIC_INFO, (thread_info_t)&info, &size) != 0) {
-        return THREAD_INVALID;
+        return THREAD_UNKNOWN;
     }
     return info.run_state == TH_STATE_RUNNING ? THREAD_RUNNING : THREAD_SLEEPING;
+}
+
+u64 OS::threadCpuTime(int thread_id) {
+    if (thread_id == 0) thread_id = threadId();
+
+    struct thread_basic_info info;
+    mach_msg_type_number_t size = sizeof(info);
+    if (thread_info((thread_act_t)thread_id, THREAD_BASIC_INFO, (thread_info_t)&info, &size) != 0) {
+        return 0;
+    }
+    return u64(info.user_time.seconds + info.system_time.seconds) * 1000000000 +
+           u64(info.user_time.microseconds + info.system_time.microseconds) * 1000;
 }
 
 ThreadList* OS::listThreads() {
@@ -215,6 +210,9 @@ SigAction OS::installSignalHandler(int signo, SigAction action, SigHandler handl
     } else {
         sa.sa_sigaction = action;
         sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        if (signo > 0 && signo < sizeof(installed_sigaction) / sizeof(installed_sigaction[0])) {
+            installed_sigaction[signo] = action;
+        }
     }
 
     sigaction(signo, &sa, &oldsa);
@@ -228,6 +226,28 @@ SigAction OS::replaceCrashHandler(SigAction action) {
     sa.sa_sigaction = action;
     sigaction(SIGBUS, &sa, NULL);
     return old_action;
+}
+
+int OS::getProfilingSignal(int mode) {
+    static int preferred_signals[2] = {SIGPROF, SIGVTALRM};
+
+    const u64 allowed_signals =
+        1ULL << SIGPROF | 1ULL << SIGVTALRM | 1ULL << SIGEMT | 1ULL << SIGSYS;
+
+    int& signo = preferred_signals[mode];
+    int initial_signo = signo;
+    int other_signo = preferred_signals[1 - mode];
+
+    do {
+        struct sigaction sa;
+        if ((allowed_signals & (1ULL << signo)) != 0 && signo != other_signo && sigaction(signo, NULL, &sa) == 0) {
+            if (sa.sa_handler == SIG_DFL || sa.sa_handler == SIG_IGN || sa.sa_sigaction == installed_sigaction[signo]) {
+                return signo;
+            }
+        }
+    } while ((signo = (signo + 1) & 31) != initial_signo);
+
+    return signo;
 }
 
 bool OS::sendSignalToThread(int thread_id, int signo) {
@@ -268,6 +288,12 @@ bool OS::getCpuDescription(char* buf, size_t size) {
     return sysctlbyname("machdep.cpu.brand_string", buf, &size, NULL, 0) == 0;
 }
 
+int OS::getCpuCount() {
+    int cpu_count;
+    size_t size = sizeof(cpu_count);
+    return sysctlbyname("hw.logicalcpu", &cpu_count, &size, NULL, 0) == 0 ? cpu_count : 1;
+}
+
 u64 OS::getProcessCpuTime(u64* utime, u64* stime) {
     struct tms buf;
     clock_t real = times(&buf);
@@ -302,6 +328,11 @@ u64 OS::getTotalCpuTime(u64* utime, u64* stime) {
     *utime = user;
     *stime = system;
     return user + system + idle;
+}
+
+int OS::createMemoryFile(const char* name) {
+    // Not supported on macOS
+    return -1;
 }
 
 void OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {

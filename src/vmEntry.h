@@ -1,36 +1,26 @@
 /*
- * Copyright 2016 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef _VMENTRY_H
 #define _VMENTRY_H
 
 #include <jvmti.h>
-
-
-#ifdef __clang__
-#  define DLLEXPORT __attribute__((visibility("default")))
-#else
-#  define DLLEXPORT __attribute__((visibility("default"),externally_visible))
-#endif
+#include "arch.h"
 
 
 enum FrameTypeId {
     FRAME_INTERPRETED  = 0,
     FRAME_JIT_COMPILED = 1,
     FRAME_INLINED      = 2,
+    // The distinction between FRAME_NATIVE and FRAME_CPP is for visual purposes
+    // to make differentiating between libc and application code easier, which
+    // means that C and asm code is FRAME_NATIVE and Rust/Objective-C code is of
+    // type FRAME_CPP.
+    //
+    // There probably should be a better way of doing this distinction, but it
+    // works well enough in practice.
     FRAME_NATIVE       = 3,
     FRAME_CPP          = 4,
     FRAME_KERNEL       = 5,
@@ -58,8 +48,8 @@ enum ASGCT_CallFrameType {
     BCI_LOCK                = -14,  // class name of the locked object
     BCI_PARK                = -15,  // class name of the park() blocker
     BCI_THREAD_ID           = -16,  // method_id designates a thread
-    BCI_ERROR               = -17,  // method_id is an error string
-    BCI_INSTRUMENT          = -18,  // synthetic method_id that should not appear in the call stack
+    BCI_ADDRESS             = -17,  // method_id is a PC address
+    BCI_ERROR               = -18,  // method_id is an error string
 };
 
 // See hotspot/src/share/vm/prims/forte.cpp
@@ -81,6 +71,7 @@ enum ASGCT_Failure {
 
 typedef struct {
     jint bci;
+    LP64_ONLY(jint padding;)
     jmethodID method_id;
 } ASGCT_CallFrame;
 
@@ -92,12 +83,7 @@ typedef struct {
 
 typedef void (*AsyncGetCallTrace)(ASGCT_CallTrace*, jint, void*);
 
-typedef struct {
-    void* unused[38];
-    jstring (JNICALL *ExecuteDiagnosticCommand)(JNIEnv*, jstring);
-} VMManagement;
-
-typedef VMManagement* (*JVM_GetManagement)(jint);
+typedef jlong (*JVM_MemoryFunc)();
 
 typedef struct {
     void* unused1[86];
@@ -115,26 +101,25 @@ class VM {
     static int _hotspot_version;
     static bool _openj9;
     static bool _zing;
-    static bool _can_sample_objects;
 
     static jvmtiError (JNICALL *_orig_RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
     static jvmtiError (JNICALL *_orig_RetransformClasses)(jvmtiEnv*, jint, const jclass* classes);
 
     static void ready();
     static void applyPatch(char* func, const char* patch, const char* end_patch);
-    static void* getLibraryHandle(const char* name);
     static void loadMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni, jclass klass);
     static void loadAllMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni);
 
   public:
-    static void* _libjvm;
-    static void* _libjava;
     static AsyncGetCallTrace _asyncGetCallTrace;
-    static JVM_GetManagement _getManagement;
+    static JVM_MemoryFunc _totalMemory;
+    static JVM_MemoryFunc _freeMemory;
 
     static bool init(JavaVM* vm, bool attach);
 
-    static void restartProfiler();
+    static bool loaded() {
+        return _jvmti != NULL;
+    }
 
     static jvmtiEnv* jvmti() {
         return _jvmti;
@@ -142,7 +127,7 @@ class VM {
 
     static JNIEnv* jni() {
         JNIEnv* jni;
-        return _vm->GetEnv((void**)&jni, JNI_VERSION_1_6) == 0 ? jni : NULL;
+        return _vm && _vm->GetEnv((void**)&jni, JNI_VERSION_1_6) == 0 ? jni : NULL;
     }
 
     static JNIEnv* attachThread(const char* name) {
@@ -153,10 +138,6 @@ class VM {
 
     static void detachThread() {
         _vm->DetachCurrentThread();
-    }
-
-    static VMManagement* management() {
-        return _getManagement != NULL ? _getManagement(0x20030000) : NULL;
     }
 
     static int hotspot_version() {
@@ -171,8 +152,16 @@ class VM {
         return _zing;
     }
 
-    static bool canSampleObjects() {
-        return _can_sample_objects;
+    static bool addSampleObjectsCapability() {
+        jvmtiCapabilities capabilities = {0};
+        capabilities.can_generate_sampled_object_alloc_events = 1;
+        return _jvmti->AddCapabilities(&capabilities) == 0;
+    }
+
+    static void releaseSampleObjectsCapability() {
+        jvmtiCapabilities capabilities = {0};
+        capabilities.can_generate_sampled_object_alloc_events = 1;
+        _jvmti->RelinquishCapabilities(&capabilities);
     }
 
     static void JNICALL VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread);

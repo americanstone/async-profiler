@@ -3,16 +3,16 @@
 <head>
 <meta charset='utf-8'>
 <style>
-	body {margin: 0; padding: 10px; background-color: #ffffff}
+	body {margin: 0; padding: 10px 10px 22px 10px; background-color: #ffffff}
 	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
 	header {margin: -24px 0 5px 0; line-height: 24px}
 	button {font: 12px sans-serif; cursor: pointer}
-	p {margin: 5px 0 5px 0}
+	p {position: fixed; bottom: 0; margin: 0; padding: 2px 3px 2px 3px; outline: 1px solid #ffc000; display: none; overflow: hidden; white-space: nowrap; background-color: #ffffe0}
 	a {color: #0366d6}
 	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
 	#hl span {padding: 0 3px 0 3px}
-	#status {overflow: hidden; white-space: nowrap}
-	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#status {left: 0}
+	#match {right: 0}
 	#reset {cursor: pointer}
 	#canvas {width: 100%; height: /*height:*/300px}
 </style>
@@ -20,17 +20,19 @@
 <body style='font: 12px Verdana, sans-serif'>
 <h1>/*title:*/</h1>
 <header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
-<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/async-profiler/async-profiler'>async-profiler</a></header>
 <canvas id='canvas'></canvas>
 <div id='hl'><span></span></div>
+<p id='status'></p>
 <p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
-<p id='status'>&nbsp;</p>
 <script>
-	// Copyright 2020 Andrei Pangin
-	// Licensed under the Apache License, Version 2.0.
+	// Copyright The async-profiler authors
+	// SPDX-License-Identifier: Apache-2.0
 	'use strict';
-	var root, rootLevel, px, pattern;
-	var reverse = /*reverse:*/false;
+	let root, px, pattern;
+	let level0 = 0, left0 = 0, width0 = 0;
+	let nav = [], navIndex, matchval;
+	let reverse = /*reverse:*/false;
 	const levels = Array(/*depth:*/0);
 	for (let h = 0; h < levels.length; h++) {
 		levels[h] = [];
@@ -64,10 +66,19 @@
 		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
 	}
 
-	function f(level, left, width, type, title, inln, c1, int) {
-		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+	function f(key, level, left, width, inln, c1, int) {
+		levels[level0 = level].push({level, left: left0 += left, width: width0 = width || width0,
+			color: getColor(palette[key & 7]), title: cpool[key >>> 3],
 			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
 		});
+	}
+
+	function u(key, width, inln, c1, int) {
+		f(key, level0 + 1, 0, width, inln, c1, int)
+	}
+
+	function n(key, width, inln, c1, int) {
+		f(key, level0, width0, width, inln, c1, int)
 	}
 
 	function samples(n) {
@@ -101,25 +112,41 @@
 		return null;
 	}
 
+	function removeStack(left, width) {
+		for (let h = 0; h < levels.length; h++) {
+			const frames = levels[h], newFrames = [];
+			for (let i = 0; i < frames.length; i++) {
+				const f = frames[i];
+				if (f.left >= left + width) {
+					f.left -= width;
+				} else if (f.left + f.width > left) {
+					if ((f.width -= width) <= 0 && h) continue;
+				}
+				newFrames.push(f);
+			}
+			levels[h] = newFrames;
+		}
+	}
+
 	function search(r) {
 		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
 			return;
 		}
 
 		pattern = r ? RegExp(r) : undefined;
-		const matched = render(root, rootLevel);
-		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
-		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+		const matched = render(root, nav = []);
+		navIndex = -1;
+		document.getElementById('matchval').textContent = matchval = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inline-block' : 'none';
 	}
 
-	function render(newRoot, newLevel) {
+	function render(newRoot, nav) {
 		if (root) {
 			c.fillStyle = '#ffffff';
 			c.fillRect(0, 0, canvasWidth, canvasHeight);
 		}
 
 		root = newRoot || levels[0][0];
-		rootLevel = newLevel || 0;
 		px = canvasWidth / root.width;
 
 		const x0 = root.left;
@@ -127,7 +154,7 @@
 		const marked = [];
 
 		function mark(f) {
-			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+			return marked[f.left] || (marked[f.left] = f);
 		}
 
 		function totalMarked() {
@@ -135,14 +162,16 @@
 			let left = 0;
 			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
 				if (+x >= left) {
-					total += marked[x];
-					left = +x + marked[x];
+					const m = marked[x];
+					if (nav) nav.push(m);
+					total += m.width;
+					left = +x + m.width;
 				}
 			});
 			return total;
 		}
 
-		function drawFrame(f, y, alpha) {
+		function drawFrame(f, y) {
 			if (f.left < x1 && f.left + f.width > x0) {
 				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
 				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
@@ -154,7 +183,7 @@
 					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
 				}
 
-				if (alpha) {
+				if (f.level < root.level) {
 					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
 					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
 				}
@@ -165,11 +194,17 @@
 			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
 			const frames = levels[h];
 			for (let i = 0; i < frames.length; i++) {
-				drawFrame(frames[i], y, h < rootLevel);
+				drawFrame(frames[i], y);
 			}
 		}
 
 		return totalMarked();
+	}
+
+	function unpack(cpool) {
+		for (let i = 1; i < cpool.length; i++) {
+			cpool[i] = cpool[i - 1].substring(0, cpool[i].charCodeAt(0) - 32) + cpool[i].substring(1);
+		}
 	}
 
 	canvas.onmousemove = function() {
@@ -177,7 +212,7 @@
 		if (h >= 0 && h < levels.length) {
 			const f = findFrame(levels[h], event.offsetX / px + root.left);
 			if (f) {
-				if (f != root) getSelection().removeAllRanges();
+				if (f !== root) getSelection().removeAllRanges();
 				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
 				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
 				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
@@ -186,12 +221,16 @@
 				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
 				canvas.style.cursor = 'pointer';
 				canvas.onclick = function() {
-					if (f != root) {
-						render(f, h);
-						canvas.onmousemove();
+					if (event.altKey && h >= root.level) {
+						removeStack(f.left, f.width);
+						root.width > f.width ? render(root) : render();
+					} else if (f !== root) {
+						render(f);
 					}
+					canvas.onmousemove();
 				};
 				status.textContent = 'Function: ' + canvas.title;
+				status.style.display = 'inline-block';
 				return;
 			}
 		}
@@ -200,10 +239,10 @@
 
 	canvas.onmouseout = function() {
 		hl.style.display = 'none';
-		status.textContent = '\xa0';
+		status.style.display = 'none';
 		canvas.title = '';
 		canvas.style.cursor = '';
-		canvas.onclick = '';
+		canvas.onclick = null;
 	}
 
 	canvas.ondblclick = function() {
@@ -223,14 +262,25 @@
 		search(false);
 	}
 
-	window.onkeydown = function() {
-		if (event.ctrlKey && event.keyCode === 70) {
+	window.onkeydown = function(event) {
+		if ((event.ctrlKey || event.metaKey) && event.key === 'f') {
 			event.preventDefault();
 			search(true);
-		} else if (event.keyCode === 27) {
+		} else if (event.key === 'Escape') {
 			search(false);
+		} else if ((event.key === 'n' || event.key === 'N') && nav.length > 0) {
+			navIndex = (navIndex + (event.shiftKey ? nav.length - 1 : 1)) % nav.length;
+			render(nav[navIndex]);
+			document.getElementById('matchval').textContent = matchval + ' (' + (navIndex + 1) + ' of ' + nav.length + ')';
+			window.scroll(0, reverse ? root.level * 16 : canvasHeight - (root.level + 1) * 16);
+			canvas.onmousemove();
 		}
 	}
+
+const cpool = [
+/*cpool:*/
+];
+unpack(cpool);
 
 /*frames:*/
 search(/*highlight:*/);

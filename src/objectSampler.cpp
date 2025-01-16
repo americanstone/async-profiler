@@ -1,17 +1,6 @@
 /*
- * Copyright 2022 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <string.h>
@@ -111,6 +100,9 @@ class LiveRefs {
         jvmtiEnv* jvmti = VM::jvmti();
         Profiler* profiler = Profiler::instance();
 
+        // Reset counters before dumping to collect live objects only.
+        profiler->tryResetCounters();
+
         for (u32 i = 0; i < MAX_REFS; i++) {
             if ((i % 32) == 0) jni->PushLocalFrame(64);
 
@@ -119,13 +111,14 @@ class LiveRefs {
                 jobject obj = jni->NewLocalRef(w);
                 if (obj != NULL) {
                     LiveObject event;
+                    event._start_time = TSC::ticks();
                     event._alloc_size = _values[i].size;
                     event._alloc_time = _values[i].time;
                     event._class_id = lookupClassId(jvmti, jni->GetObjectClass(obj));
 
                     int tid = _values[i].trace >> 32;
                     u32 call_trace_id = (u32)_values[i].trace;
-                    profiler->recordExternalSample(event._alloc_size, tid, BCI_LIVE_OBJECT, &event, call_trace_id);
+                    profiler->recordExternalSamples(1, event._alloc_size, tid, call_trace_id, LIVE_OBJECT, &event);
                 }
                 jni->DeleteWeakGlobalRef(w);
             }
@@ -141,7 +134,7 @@ static LiveRefs live_refs;
 void ObjectSampler::SampledObjectAlloc(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
                                        jobject object, jclass object_klass, jlong size) {
     if (_enabled) {
-        recordAllocation(jvmti, jni, BCI_ALLOC, object, object_klass, size);
+        recordAllocation(jvmti, jni, ALLOC_SAMPLE, object, object_klass, size);
     }
 }
 
@@ -149,18 +142,17 @@ void ObjectSampler::GarbageCollectionStart(jvmtiEnv* jvmti) {
     live_refs.gc();
 }
 
-void ObjectSampler::recordAllocation(jvmtiEnv* jvmti, JNIEnv* jni, int event_type,
+void ObjectSampler::recordAllocation(jvmtiEnv* jvmti, JNIEnv* jni, EventType event_type,
                                      jobject object, jclass object_klass, jlong size) {
     AllocEvent event;
+    event._start_time = TSC::ticks();
     event._total_size = size > _interval ? size : _interval;
     event._instance_size = size;
     event._class_id = lookupClassId(jvmti, object_klass);
 
-    if (_live) {
-        u64 trace = Profiler::instance()->recordSample(NULL, 0, event_type, &event);
+    u64 trace = Profiler::instance()->recordSample(NULL, event._total_size, event_type, &event);
+    if (_live && trace != 0) {
         live_refs.add(jni, object, size, trace);
-    } else {
-        Profiler::instance()->recordSample(NULL, size, event_type, &event);
     }
 }
 
@@ -177,19 +169,7 @@ void ObjectSampler::dumpLiveRefs() {
     }
 }
 
-Error ObjectSampler::check(Arguments& args) {
-    if (!VM::canSampleObjects()) {
-        return Error("SampledObjectAlloc is not supported on this JVM");
-    }
-    return Error::OK;
-}
-
 Error ObjectSampler::start(Arguments& args) {
-    Error error = check(args);
-    if (error) {
-        return error;
-    }
-
     _interval = args._alloc > 0 ? args._alloc : DEFAULT_ALLOC_INTERVAL;
 
     initLiveRefs(args._live);
@@ -206,6 +186,8 @@ void ObjectSampler::stop() {
     jvmtiEnv* jvmti = VM::jvmti();
     jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_GARBAGE_COLLECTION_START, NULL);
     jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_SAMPLED_OBJECT_ALLOC, NULL);
+
+    VM::releaseSampleObjectsCapability();
 
     dumpLiveRefs();
 }

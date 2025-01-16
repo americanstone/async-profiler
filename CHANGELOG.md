@@ -1,5 +1,124 @@
 # Changelog
 
+## [4.0] - Early Access
+
+### Features
+ - #895, #905: `jfrconv` binary and numerous converter enhancements
+ - #944: Interactive Heatmap
+ - #1064: Native memory leak profiler
+ - #1002: An option to display instruction addresses
+ - #1007: Optimize wall clock profiling
+ - #1073: Productize VMStructs-based stack walker: `--cstack vm/vmx`
+
+### Improvements
+ - #923: Support JDK 23+
+ - #952: Solve musl and glibc compatibility issues; link `libstdc++` statically
+ - #955: `--libpath` option to specify path to `libasyncProfiler.so` in a container
+ - #1018: `--grain` converter option to coarsen flame graphs
+ - #1046: `--nostop` option to continue profiling outside `--begin`/`--end` window
+ - #1009: Allows collecting allocation and live object traces at the same time
+ - #925: An option to accumulate JFR events in memory instead of flushing to a file
+ - #929: Load symbols from debuginfod cache
+ - #982: Sample contended locks by overflowing interval bucket
+ - #993: Filter native frames in allocation profile
+ - #896: FlameGraph: `Alt+Click` to remove stacks
+ - #1097: FlameGraph: `N`/`Shift+N` to navigate through search results
+ - #1044: Fall back to `ctimer` for CPU profiling when perf_events are unavailable
+ - #1068: Count missed samples when estimating total CPU time in `ctimer` mode
+ - #1070: Demangle Rust v0 symbols
+ - #1007: Use `ExecutionSample` event for CPU profiling and `WallClockSample` for Wall clock profiling
+ - #1011: Obtain `can_generate_sampled_object_alloc_events` JVMTI capability only when needed
+ - #1013: Intercept java.util.concurrent locks more efficiently
+ - #759: Discover available profiling signal automatically
+ - #884: Record event timestamps early
+ - #885: Print error message if JVM fails to load libasyncProfiler
+ - #892: Resolve tracepoint id in `asprof`
+ - Suppress dynamic attach warning on JDK 21+
+
+### Bug fixes
+ - #1095: jfr print fails when a recording has empty pools
+ - #1084: Fixed Logging related races
+ - #1074: Parse both .rela.dyn and .rela.plt sections
+ - #1003: Support both tracefs and debugfs for kernel tracepoints
+ - #986: Profiling output respects loglevel
+ - #981: Avoid JVM crash by deleting JNI refs after `GetMethodDeclaringClass`
+ - #934: Fix crash on Zing in a native thread
+ - #843: Fix race between parsing and concurrent unloading of shared libraries
+ - Stack walking fixes for ARM64
+ - Converter fixes for `jfrsync` profiles
+ - Fixed parsing non-PIC executables
+ - Fixed recursion in `pthread_create` when using native profiling API
+ - Fixed crashes on Alpine when profiling native apps
+ - Fixed warnings with `-Xcheck:jni`
+ - Fixed DefineClass crash on OpenJ9
+ - JfrReader should handle custom events properly
+ - Handle truncated JFRs
+
+### Project Infrastructure
+ - Restructure and update documentation
+ - Implement test framework; add new integration tests
+ - Unit test framework for C++ code
+ - Run CI on all supported platforms
+ - Test Corretto 11, 17, 21, 23 in CI
+ - Add GHA to validate license headers
+ - Add Markdown checker and formatter
+ - Add Issue and Pull Request templates
+ - Add Contributing Guidelines and Code of Conduct
+ - Run static analyzer and fix found issues (#1034, #1039, #1049, #1051, #1098)
+ - Provide Docker image for building async-profiler release packages
+ - Publish nightly builds automatically
+
+## [3.0] - 2024-01-20
+
+### Features
+ - #724: Binary launcher `asprof`
+ - #751: Profile non-Java processes
+ - #795: AsyncGetCallTrace replacement
+ - #719: Classify execution samples into categories in JFR converter
+ - #855: `ctimer` mode for accurate profiling without perf_events
+ - #740: Profile CPU + Wall clock together
+ - #736: Show targets of vtable/itable calls
+ - #777: Show JIT compilation task
+ - #644: RISC-V port
+ - #770: LoongArch64 port
+
+### Improvements
+ - #733: Make the same `libasyncProfiler` work with both glibc and musl
+ - #734: Support raw PMU event descriptors
+ - #759: Configure alternative profiling signal
+ - #761: Parse dynamic linking structures
+ - #723: `--clock` option to select JFR timestamp source
+ - #750: `--jfrsync` may specify a list of JFR events
+ - #849: Parse concatenated multi-chunk JFRs
+ - #833: Time-to-safepoint JFR event
+ - #832: Normalize names of hidden classes / lambdas
+ - #864: Reduce size of HTML Flame Graph
+ - #783: Shutdown asprof gracefully on SIGTERM
+ - Better demangling of C++ and Rust symbols
+ - DWARF unwinding for ARM64
+ - `JfrReader` can parse in-memory buffer
+ - Support custom events in `JfrReader`
+ - An option to read JFR file by chunks
+ - Record `GCHeapSummary` events in JFR
+
+### Bug fixes
+ - Workaround macOS crashes in SafeFetch
+ - Fixed attach to OpenJ9 on macOS
+ - Support `UseCompressedObjectHeaders` aka Lilliput
+ - Fixed allocation profiling on JDK 20.0.x
+ - Fixed context-switches profiling
+ - Prefer ObjectSampler to TLAB hooks for allocation profiling
+ - Improved accuracy of ObjectSampler in `--total` mode
+ - Make Flame Graph status line and search results always visible
+ - `loop` and `timeout` options did not work in some modes
+ - Restart interrupted poll/epoll_wait syscalls
+ - Fixed stack unwinding issues on ARM64
+ - Workaround for stale jmethodIDs
+ - Calculate ELF base address correctly
+ - Do not dump redundant threads in a JFR chunk
+ - `check` action prints result to a file
+ - Annotate JFR unit types with `@ContentType`
+
 ## [2.9] - 2022-11-27
 
 ### Features

@@ -1,17 +1,6 @@
 /*
- * Copyright 2021 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdlib.h>
@@ -24,6 +13,7 @@
 #include "j9Ext.h"
 #include "profiler.h"
 #include "perfEvents.h"
+#include "tsc.h"
 
 
 enum {
@@ -61,7 +51,7 @@ static JNIEnv* _self_env = NULL;
 
 
 Error J9StackTraces::start(Arguments& args) {
-    _max_stack_depth = args._jstackdepth; 
+    _max_stack_depth = args._jstackdepth;
 
     if (pipe(_pipe) != 0) {
         return Error("Failed to create pipe");
@@ -112,6 +102,7 @@ void J9StackTraces::timerLoop() {
         ssize_t ptr = 0;
         while (ptr < bytes) {
             J9StackTraceNotification* notif = (J9StackTraceNotification*)(notification_buf + ptr);
+            u64 start_time = TSC::ticks();
 
             jthread thread = known_threads[notif->env];
             jint num_jvmti_frames;
@@ -135,7 +126,7 @@ void J9StackTraces::timerLoop() {
                 }
             }
 
-            int num_frames = Profiler::instance()->convertNativeTrace(notif->num_frames, notif->addr, frames);
+            int num_frames = Profiler::instance()->convertNativeTrace(notif->num_frames, notif->addr, frames, EXECUTION_SAMPLE);
 
             for (int j = 0; j < num_jvmti_frames; j++) {
                 frames[num_frames].method_id = jvmti_frames[j].method;
@@ -144,8 +135,8 @@ void J9StackTraces::timerLoop() {
             }
 
             int tid = J9Ext::GetOSThreadID(thread);
-            ExecutionEvent event;
-            Profiler::instance()->recordExternalSample(notif->counter, tid, 0, &event, num_frames, frames);
+            ExecutionEvent event(start_time);
+            Profiler::instance()->recordExternalSample(notif->counter, tid, EXECUTION_SAMPLE, &event, num_frames, frames);
 
             ptr += notif->size();
         }

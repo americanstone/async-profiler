@@ -1,23 +1,13 @@
 /*
- * Copyright 2020 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <string.h>
 #include "callTraceStorage.h"
 #include "os.h"
 
+#define COMMA ,
 
 static const u32 INITIAL_CAPACITY = 65536;
 static const u32 CALL_TRACE_CHUNK = 8 * 1024 * 1024;
@@ -89,8 +79,7 @@ class LongHashTable {
     }
 };
 
-
-CallTrace CallTraceStorage::_overflow_trace = {1, {BCI_ERROR, (jmethodID)"storage_overflow"}};
+CallTrace CallTraceStorage::_overflow_trace = {1, {BCI_ERROR, LP64_ONLY(0 COMMA) (jmethodID)"storage_overflow"}};
 
 CallTraceStorage::CallTraceStorage() : _allocator(CALL_TRACE_CHUNK) {
     _current_table = LongHashTable::allocate(NULL, INITIAL_CAPACITY);
@@ -285,7 +274,7 @@ u32 CallTraceStorage::put(int num_frames, ASGCT_CallFrame* frames, u64 counter) 
     return capacity - (INITIAL_CAPACITY - 1) + slot;
 }
 
-void CallTraceStorage::add(u32 call_trace_id, u64 counter) {
+void CallTraceStorage::add(u32 call_trace_id, u64 samples, u64 counter) {
     if (call_trace_id == OVERFLOW_TRACE_ID) {
         return;
     }
@@ -294,9 +283,25 @@ void CallTraceStorage::add(u32 call_trace_id, u64 counter) {
     for (LongHashTable* table = _current_table; table != NULL; table = table->prev()) {
         if (call_trace_id >= table->capacity()) {
             CallTraceSample& s = table->values()[call_trace_id - table->capacity()];
-            atomicInc(s.samples);
+            atomicInc(s.samples, samples);
             atomicInc(s.counter, counter);
             break;
+        }
+    }
+}
+
+void CallTraceStorage::resetCounters() {
+     for (LongHashTable* table = _current_table; table != NULL; table = table->prev()) {
+        u64* keys = table->keys();
+        CallTraceSample* values = table->values();
+        u32 capacity = table->capacity();
+
+        for (u32 slot = 0; slot < capacity; slot++) {
+            if (keys[slot] != 0) {
+                CallTraceSample& s = values[slot];
+                storeRelease(s.samples, 0);
+                storeRelease(s.counter, 0);
+            }
         }
     }
 }

@@ -1,23 +1,11 @@
 /*
- * Copyright 2016 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <fstream>
-#include <sstream>
 #include <errno.h>
 #include <string.h>
+#include "asprof.h"
 #include "incbin.h"
 #include "javaApi.h"
 #include "os.h"
@@ -25,7 +13,7 @@
 #include "vmStructs.h"
 
 
-INCBIN(SERVER_CLASS, "one/profiler/Server.class")
+INCLUDE_HELPER_CLASS(SERVER_NAME, SERVER_CLASS, "one/profiler/Server")
 
 
 static void throwNew(JNIEnv* env, const char* exception_class, const char* message) {
@@ -43,7 +31,7 @@ Java_one_profiler_AsyncProfiler_start0(JNIEnv* env, jobject unused, jstring even
     if (strcmp(event_str, EVENT_ALLOC) == 0) {
         args._alloc = interval > 0 ? interval : 0;
     } else if (strcmp(event_str, EVENT_LOCK) == 0) {
-        args._lock = interval > 0 ? interval : 0;
+        args._lock = interval >= 0 ? interval : DEFAULT_LOCK_INTERVAL;
     } else {
         args._event = event_str;
         args._interval = interval;
@@ -81,23 +69,23 @@ Java_one_profiler_AsyncProfiler_execute0(JNIEnv* env, jobject unused, jstring co
     Log::open(args);
 
     if (!args.hasOutputFile()) {
-        std::ostringstream out;
+        BufferWriter out;
         error = Profiler::instance()->runInternal(args, out);
         if (!error) {
-            if (out.tellp() >= 0x3fffffff) {
+            out << '\0';
+            if (out.size() >= 0x3fffffff) {
                 throwNew(env, "java/lang/IllegalStateException", "Output exceeds string size limit");
                 return NULL;
             }
-            return env->NewStringUTF(out.str().c_str());
+            return env->NewStringUTF(out.buf());
         }
     } else {
-        std::ofstream out(args.file(), std::ios::out | std::ios::trunc);
+        FileWriter out(args.file());
         if (!out.is_open()) {
             throwNew(env, "java/io/IOException", strerror(errno));
             return NULL;
         }
         error = Profiler::instance()->runInternal(args, out);
-        out.close();
         if (!error) {
             return env->NewStringUTF("OK");
         }
@@ -179,7 +167,7 @@ bool JavaAPI::startHttpServer(jvmtiEnv* jvmti, JNIEnv* jni, const char* address)
     jclass handler = jni->FindClass("com/sun/net/httpserver/HttpHandler");
     jobject loader;
     if (handler != NULL && jvmti->GetClassLoader(handler, &loader) == 0) {
-        jclass cls = jni->DefineClass(NULL, loader, (const jbyte*)SERVER_CLASS, INCBIN_SIZEOF(SERVER_CLASS));
+        jclass cls = jni->DefineClass(SERVER_NAME, loader, (const jbyte*)SERVER_CLASS, INCBIN_SIZEOF(SERVER_CLASS));
         if (cls != NULL && jni->RegisterNatives(cls, execute0, 1) == 0) {
             jmethodID method = jni->GetStaticMethodID(cls, "start", "(Ljava/lang/String;)V");
             if (method != NULL) {

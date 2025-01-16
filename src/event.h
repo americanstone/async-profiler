@@ -1,17 +1,6 @@
 /*
- * Copyright 2020 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef _EVENT_H
@@ -21,42 +10,77 @@
 #include "os.h"
 
 
+// The order is important: look for event_type comparison
+enum EventType {
+    PERF_SAMPLE,
+    EXECUTION_SAMPLE,
+    WALL_CLOCK_SAMPLE,
+    INSTRUMENTED_METHOD,
+    MALLOC_SAMPLE,
+    ALLOC_SAMPLE,
+    ALLOC_OUTSIDE_TLAB,
+    LIVE_OBJECT,
+    LOCK_SAMPLE,
+    PARK_SAMPLE,
+    PROFILING_WINDOW,
+};
+
 class Event {
+};
+
+class EventWithClassId : public Event {
   public:
-    u32 id() {
-        return *(u32*)this;
-    }
+    u32 _class_id;
 };
 
 class ExecutionEvent : public Event {
   public:
+    u64 _start_time;
     ThreadState _thread_state;
 
-    ExecutionEvent() : _thread_state(THREAD_RUNNING) {
-    }
+    ExecutionEvent(u64 start_time) : _start_time(start_time), _thread_state(THREAD_UNKNOWN) {}
 };
 
-class AllocEvent : public Event {
+class WallClockEvent : public Event {
   public:
-    u32 _class_id;
+    u64 _start_time;
+    ThreadState _thread_state;
+    u32 _samples;
+};
+
+class AllocEvent : public EventWithClassId {
+  public:
+    u64 _start_time;
     u64 _total_size;
     u64 _instance_size;
 };
 
-class LockEvent : public Event {
+class LockEvent : public EventWithClassId {
   public:
-    u32 _class_id;
     u64 _start_time;
     u64 _end_time;
     uintptr_t _address;
     long long _timeout;
 };
 
-class LiveObject : public Event {
+class LiveObject : public EventWithClassId {
   public:
-    u32 _class_id;
+    u64 _start_time;
     u64 _alloc_size;
     u64 _alloc_time;
+};
+
+class ProfilingWindow : public Event {
+  public:
+    u64 _start_time;
+    u64 _end_time;
+};
+
+class MallocEvent : public Event {
+  public:
+    u64 _start_time;
+    uintptr_t _address;
+    u64 _size;
 };
 
 #endif // _EVENT_H

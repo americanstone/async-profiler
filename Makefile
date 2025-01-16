@@ -1,41 +1,74 @@
-PROFILER_VERSION=2.9
+PROFILER_VERSION ?= 3.0
+
+ifeq ($(COMMIT_TAG),true)
+  PROFILER_VERSION := $(PROFILER_VERSION)-$(shell git rev-parse --short=8 HEAD)
+else ifneq ($(COMMIT_TAG),)
+  PROFILER_VERSION := $(PROFILER_VERSION)-$(COMMIT_TAG)
+endif
 
 PACKAGE_NAME=async-profiler-$(PROFILER_VERSION)-$(OS_TAG)-$(ARCH_TAG)
 PACKAGE_DIR=/tmp/$(PACKAGE_NAME)
 
-LIB_PROFILER=libasyncProfiler.$(SOEXT)
-LIB_PROFILER_SO=libasyncProfiler.so
-JATTACH=jattach
-API_JAR=async-profiler.jar
-CONVERTER_JAR=converter.jar
+ASPROF=bin/asprof
+JFRCONV=bin/jfrconv
+LIB_PROFILER=lib/libasyncProfiler.$(SOEXT)
+API_JAR=jar/async-profiler.jar
+CONVERTER_JAR=jar/jfr-converter.jar
+TEST_JAR=test.jar
 
-CFLAGS=-O3
-CXXFLAGS=-O3 -fno-omit-frame-pointer -fvisibility=hidden
-INCLUDES=-I$(JAVA_HOME)/include -Isrc/res -Isrc/helper
+CC ?= gcc
+CXX ?= g++
+STRIP ?= strip
+
+ifneq ($(CROSS_COMPILE),)
+CC := $(CROSS_COMPILE)gcc
+CXX := $(CROSS_COMPILE)g++
+STRIP := $(CROSS_COMPILE)strip
+endif
+
+CFLAGS_EXTRA ?=
+CXXFLAGS_EXTRA ?=
+CFLAGS=-O3 -fno-exceptions $(CFLAGS_EXTRA)
+CXXFLAGS=-O3 -fno-exceptions -fno-omit-frame-pointer -fvisibility=hidden -std=c++11 $(CXXFLAGS_EXTRA)
+CPPFLAGS=
+DEFS=-DPROFILER_VERSION=\"$(PROFILER_VERSION)\"
+INCLUDES=-I$(JAVA_HOME)/include -Isrc/helper
 LIBS=-ldl -lpthread
 MERGE=true
+GCOV ?= gcov
 
 JAVAC=$(JAVA_HOME)/bin/javac
 JAR=$(JAVA_HOME)/bin/jar
-JAVA_TARGET=7
-JAVAC_OPTIONS=-source $(JAVA_TARGET) -target $(JAVA_TARGET) -Xlint:-options
+JAVA=$(JAVA_HOME)/bin/java
+JAVA_TARGET=8
+JAVAC_OPTIONS=--release $(JAVA_TARGET) -Xlint:-options
+
+TEST_LIB_DIR=build/test/lib
+LOG_DIR=build/test/logs
+LOG_LEVEL=
+SKIP=
+TEST_FLAGS=-DlogDir=$(LOG_DIR) -DlogLevel=$(LOG_LEVEL) -Dskip=$(SKIP)
 
 SOURCES := $(wildcard src/*.cpp)
-HEADERS := $(wildcard src/*.h src/fdtransfer/*.h)
+HEADERS := $(wildcard src/*.h)
 RESOURCES := $(wildcard src/res/*)
 JAVA_HELPER_CLASSES := $(wildcard src/helper/one/profiler/*.class)
 API_SOURCES := $(wildcard src/api/one/profiler/*.java)
 CONVERTER_SOURCES := $(shell find src/converter -name '*.java')
+TEST_SOURCES := $(shell find test -name '*.java')
+TESTS ?= $(notdir $(patsubst %/,%,$(wildcard test/test/*/)))
+CPP_TEST_SOURCES := test/native/testRunner.cpp $(shell find test/native -name '*Test.cpp')
+CPP_TEST_HEADER := test/native/testRunner.hpp
+CPP_TEST_INCLUDES := -Isrc -Itest/native
 
 ifeq ($(JAVA_HOME),)
-  export JAVA_HOME:=$(shell java -cp . JavaHome)
+  JAVA_HOME:=$(shell java -cp . JavaHome)
 endif
 
 OS:=$(shell uname -s)
 ifeq ($(OS),Darwin)
   CXXFLAGS += -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -Wl,-rpath,@executable_path/../lib -Wl,-rpath,@executable_path/../lib/server
   INCLUDES += -I$(JAVA_HOME)/include/darwin
-  FDTRANSFER_BIN=
   SOEXT=dylib
   PACKAGE_EXT=zip
   OS_TAG=macos
@@ -47,100 +80,99 @@ ifeq ($(OS),Darwin)
     MERGE=false
   endif
 else
-  CXXFLAGS += -Wl,-z,defs
+  CXXFLAGS += -U_FORTIFY_SOURCE -Wl,-z,defs -Wl,--exclude-libs,ALL -static-libstdc++ -static-libgcc -fdata-sections -ffunction-sections -Wl,--gc-sections
   ifeq ($(MERGE),true)
     CXXFLAGS += -fwhole-program
   endif
   LIBS += -lrt
   INCLUDES += -I$(JAVA_HOME)/include/linux
-  FDTRANSFER_BIN=build/fdtransfer
   SOEXT=so
   PACKAGE_EXT=tar.gz
-  ifeq ($(findstring musl,$(shell ldd /bin/ls)),musl)
-    OS_TAG=linux-musl
-    CXXFLAGS += -D__musl__
+  OS_TAG=linux
+endif
+
+ifeq ($(ARCH_TAG),)
+  ARCH:=$(shell uname -m)
+  ifeq ($(ARCH),x86_64)
+    ARCH_TAG=x64
+  else ifeq ($(ARCH),aarch64)
+    ARCH_TAG=arm64
+  else ifeq ($(ARCH),arm64)
+    ARCH_TAG=arm64
+  else ifeq ($(findstring arm,$(ARCH)),arm)
+    ARCH_TAG=arm32
+  else ifeq ($(ARCH),ppc64le)
+    ARCH_TAG=ppc64le
+  else ifeq ($(ARCH),riscv64)
+    ARCH_TAG=riscv64
+  else ifeq ($(ARCH),loongarch64)
+    ARCH_TAG=loongarch64
   else
-    OS_TAG=linux
+    ARCH_TAG=x86
   endif
 endif
 
-ARCH:=$(shell uname -m)
-ifeq ($(ARCH),x86_64)
-  ARCH_TAG=x64
-else
-  ifeq ($(findstring arm,$(ARCH)),arm)
-    ifeq ($(findstring 64,$(ARCH)),64)
-      ARCH_TAG=arm64
-    else
-      ARCH_TAG=arm32
-    endif
-  else
-    ifeq ($(findstring aarch64,$(ARCH)),aarch64)
-      ARCH_TAG=arm64
-    else
-      ifeq ($(ARCH),ppc64le)
-        ARCH_TAG=ppc64le
-      else
-        ARCH_TAG=x86
-      endif
-    endif
-  endif
+STATIC_BINARY=$(findstring musl-gcc,$(CC))
+ifneq (,$(STATIC_BINARY))
+  CFLAGS += -static -fdata-sections -ffunction-sections -Wl,--gc-sections
 endif
 
-ifneq ($(ARCH),ppc64le)
-  ifneq ($(ARCH_TAG),arm32)
-    CXXFLAGS += -momit-leaf-frame-pointer
-  endif
+ifneq (,$(findstring $(ARCH_TAG),x86 x64 arm64))
+  CXXFLAGS += -momit-leaf-frame-pointer
 endif
 
 
-.PHONY: all release test native clean
+.PHONY: all jar release build-test test native clean coverage clean-coverage build-test-java build-test-cpp build-test-libs test-cpp test-java check-md format-md
 
-all: build build/$(LIB_PROFILER) build/$(JATTACH) $(FDTRANSFER_BIN) build/$(API_JAR) build/$(CONVERTER_JAR)
+all: build/bin build/lib build/$(LIB_PROFILER) build/$(ASPROF) jar build/$(JFRCONV)
 
-release: build $(PACKAGE_NAME).$(PACKAGE_EXT)
+jar: build/jar build/$(API_JAR) build/$(CONVERTER_JAR)
+
+release: $(PACKAGE_NAME).$(PACKAGE_EXT)
 
 $(PACKAGE_NAME).tar.gz: $(PACKAGE_DIR)
+	patchelf --remove-needed ld-linux-x86-64.so.2 --remove-needed ld-linux-aarch64.so.1 $(PACKAGE_DIR)/$(LIB_PROFILER)
 	tar czf $@ -C $(PACKAGE_DIR)/.. $(PACKAGE_NAME)
 	rm -r $(PACKAGE_DIR)
 
 $(PACKAGE_NAME).zip: $(PACKAGE_DIR)
-	codesign -s "Developer ID" -o runtime --timestamp -v $(PACKAGE_DIR)/build/$(JATTACH) $(PACKAGE_DIR)/build/$(LIB_PROFILER_SO)
+	truncate -cs -`stat -f "%z" build/$(CONVERTER_JAR)` $(PACKAGE_DIR)/$(JFRCONV)
+ifneq ($(GITHUB_ACTIONS), true)
+	codesign -s "Developer ID" -o runtime --timestamp -v $(PACKAGE_DIR)/$(ASPROF) $(PACKAGE_DIR)/$(JFRCONV) $(PACKAGE_DIR)/$(LIB_PROFILER)
+endif
+	cat build/$(CONVERTER_JAR) >> $(PACKAGE_DIR)/$(JFRCONV)
 	ditto -c -k --keepParent $(PACKAGE_DIR) $@
 	rm -r $(PACKAGE_DIR)
 
-$(PACKAGE_DIR): build/$(LIB_PROFILER) build/$(JATTACH) $(FDTRANSFER_BIN) \
-                build/$(API_JAR) build/$(CONVERTER_JAR) \
-                profiler.sh LICENSE *.md
+$(PACKAGE_DIR): all LICENSE README.md
 	mkdir -p $(PACKAGE_DIR)
-	cp -RP build profiler.sh LICENSE *.md $(PACKAGE_DIR)
+	cp -RP build/bin build/lib LICENSE README.md $(PACKAGE_DIR)/
 	chmod -R 755 $(PACKAGE_DIR)
-	chmod 644 $(PACKAGE_DIR)/LICENSE $(PACKAGE_DIR)/*.md $(PACKAGE_DIR)/build/*.jar
+	chmod 644 $(PACKAGE_DIR)/lib/* $(PACKAGE_DIR)/LICENSE $(PACKAGE_DIR)/README.md
 
-%.$(SOEXT): %.so
-	rm -f $@
-	-ln -s $(<F) $@
+build/%:
+	mkdir -p $@
 
-build:
-	mkdir -p build
+build/$(ASPROF): src/main/* src/jattach/* src/fdtransfer.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEFS) -o $@ src/main/*.cpp src/jattach/*.c
+	$(STRIP) $@
 
-build/$(LIB_PROFILER_SO): $(SOURCES) $(HEADERS) $(RESOURCES) $(JAVA_HELPER_CLASSES)
+build/$(JFRCONV): src/launcher/* build/$(CONVERTER_JAR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEFS) -o $@ src/launcher/*.cpp
+	$(STRIP) $@
+	cat build/$(CONVERTER_JAR) >> $@
+
+build/$(LIB_PROFILER): $(SOURCES) $(HEADERS) $(RESOURCES) $(JAVA_HELPER_CLASSES)
 ifeq ($(MERGE),true)
 	for f in src/*.cpp; do echo '#include "'$$f'"'; done |\
-	$(CXX) $(CXXFLAGS) -DPROFILER_VERSION=\"$(PROFILER_VERSION)\" $(INCLUDES) -fPIC -shared -o $@ -xc++ - $(LIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) -fPIC -shared -o $@ -xc++ - $(LIBS)
 else
-	$(CXX) $(CXXFLAGS) -DPROFILER_VERSION=\"$(PROFILER_VERSION)\" $(INCLUDES) -fPIC -shared -o $@ $(SOURCES) $(LIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) -fPIC -shared -o $@ $(SOURCES) $(LIBS)
 endif
-
-build/$(JATTACH): src/jattach/*.c src/jattach/*.h
-	$(CC) $(CFLAGS) -DJATTACH_VERSION=\"$(PROFILER_VERSION)-ap\" -o $@ src/jattach/*.c
-
-build/fdtransfer: src/fdtransfer/*.cpp src/fdtransfer/*.h src/jattach/psutil.c src/jattach/psutil.h
-	$(CXX) $(CFLAGS) -o $@ src/fdtransfer/*.cpp src/jattach/psutil.c
 
 build/$(API_JAR): $(API_SOURCES)
 	mkdir -p build/api
-	$(JAVAC) $(JAVAC_OPTIONS) -d build/api $^
+	$(JAVAC) $(JAVAC_OPTIONS) -d build/api $(API_SOURCES)
 	$(JAR) cf $@ -C build/api .
 	$(RM) -r build/api
 
@@ -151,21 +183,64 @@ build/$(CONVERTER_JAR): $(CONVERTER_SOURCES) $(RESOURCES)
 	$(RM) -r build/converter
 
 %.class: %.java
-	$(JAVAC) $(JAVAC_OPTIONS) -g:none $^
+	$(JAVAC) -source 7 -target 7 -Xlint:-options -g:none $^
 
-test: all
-	test/smoke-test.sh
-	test/thread-smoke-test.sh
-	test/alloc-smoke-test.sh
-	test/load-library-test.sh
-	test/fdtransfer-smoke-test.sh
-	echo "All tests passed"
+build/test/cpptests: $(CPP_TEST_SOURCES) $(CPP_TEST_HEADER) $(SOURCES) $(HEADERS) $(RESOURCES) $(JAVA_HELPER_CLASSES)
+	mkdir -p build/test
+ifeq ($(MERGE),true)
+	for f in src/*.cpp test/native/*.cpp; do echo '#include "'$$f'"'; done |\
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ -xc++ - $(LIBS)
+else
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ $(SOURCES) $(CPP_TEST_SOURCES) $(LIBS)
+endif
+
+build-test-java: all build/$(TEST_JAR) build-test-libs
+
+build-test-cpp: build/test/cpptests build-test-libs
+
+build-test: build-test-cpp build-test-java
+
+build-test-libs:
+	@mkdir -p $(TEST_LIB_DIR)
+	$(CC) -shared -fPIC -o $(TEST_LIB_DIR)/libreladyn.$(SOEXT) test/native/libs/reladyn.c
+	$(CC) -shared -fPIC $(INCLUDES) -Isrc -o $(TEST_LIB_DIR)/libjnimalloc.$(SOEXT) test/native/libs/jnimalloc.c
+
+test-cpp: build-test-cpp
+	echo "Running cpp tests..."
+	LD_LIBRARY_PATH="$(TEST_LIB_DIR)" build/test/cpptests
+
+test-java: build-test-java
+	echo "Running tests against $(LIB_PROFILER)"
+	$(JAVA) "-Djava.library.path=$(TEST_LIB_DIR)" $(TEST_FLAGS) -ea -cp "build/test.jar:build/jar/*:build/lib/*" one.profiler.test.Runner $(TESTS)
+
+coverage: override FAT_BINARY=false
+coverage: clean-coverage
+	$(MAKE) test-cpp CXXFLAGS_EXTRA="-fprofile-arcs -ftest-coverage -fPIC -O0 --coverage"
+	mkdir -p build/test/coverage
+	cd build/test/ && gcovr -r ../.. --html-details --gcov-executable "$(GCOV)" -o coverage/index.html
+	rm -rf -- -.gc*
+
+test: test-cpp test-java
+
+build/$(TEST_JAR): $(TEST_SOURCES) build/$(CONVERTER_JAR)
+	mkdir -p build/test
+	$(JAVAC) -source $(JAVA_TARGET) -target $(JAVA_TARGET) -Xlint:-options -cp "build/jar/*:build/converter/*" -d build/test $(TEST_SOURCES)
+	$(JAR) cf $@ -C build/test .
 
 native:
 	mkdir -p native/linux-x64 native/linux-arm64 native/macos
 	tar xfO async-profiler-$(PROFILER_VERSION)-linux-x64.tar.gz */build/libasyncProfiler.so > native/linux-x64/libasyncProfiler.so
 	tar xfO async-profiler-$(PROFILER_VERSION)-linux-arm64.tar.gz */build/libasyncProfiler.so > native/linux-arm64/libasyncProfiler.so
-	unzip -p async-profiler-$(PROFILER_VERSION)-macos.zip */build/libasyncProfiler.so > native/macos/libasyncProfiler.so
+	unzip -p async-profiler-$(PROFILER_VERSION)-macos.zip */build/libasyncProfiler.dylib > native/macos/libasyncProfiler.dylib
+
+check-md:
+	prettier -c README.md "docs/**/*.md"
+
+format-md:
+	prettier -w README.md "docs/**/*.md"
+
+clean-coverage:
+	$(RM) -rf build/test/cpptests build/test/coverage
 
 clean:
 	$(RM) -r build

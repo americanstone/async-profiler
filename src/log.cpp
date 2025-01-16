@@ -1,20 +1,11 @@
 /*
- * Copyright 2021 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 #include "log.h"
 #include "profiler.h"
 
@@ -28,8 +19,9 @@ const char* const Log::LEVEL_NAME[] = {
     "NONE"
 };
 
-FILE* Log::_file = stdout;
-LogLevel Log::_level = LOG_TRACE;
+Mutex Log::_lock;
+int Log::_fd = STDOUT_FILENO;
+LogLevel Log::_level = LOG_INFO;
 
 
 void Log::open(Arguments& args) {
@@ -41,20 +33,7 @@ void Log::open(Arguments& args) {
 }
 
 void Log::open(const char* file_name, const char* level) {
-    if (_file != stdout && _file != stderr) {
-        fclose(_file);
-    }
-
-    if (file_name == NULL || strcmp(file_name, "stdout") == 0) {
-        _file = stdout;
-    } else if (strcmp(file_name, "stderr") == 0) {
-        _file = stderr;
-    } else if ((_file = fopen(file_name, "w")) == NULL) {
-        _file = stdout;
-        warn("Could not open log file: %s", file_name);
-    }
-
-    LogLevel l = LOG_TRACE;
+    LogLevel l = LOG_INFO;
     if (level != NULL) {
         for (int i = LOG_TRACE; i <= LOG_NONE; i++) {
             if (strcasecmp(LEVEL_NAME[i], level) == 0) {
@@ -63,31 +42,67 @@ void Log::open(const char* file_name, const char* level) {
             }
         }
     }
-    __atomic_store_n(&_level, l, __ATOMIC_RELEASE);
+
+    MutexLocker ml(_lock);
+    _level = l;
+
+    if (_fd > STDERR_FILENO) {
+        ::close(_fd);
+    }
+
+    if (file_name == NULL || strcmp(file_name, "stdout") == 0) {
+        _fd = STDOUT_FILENO;
+    } else if (strcmp(file_name, "stderr") == 0) {
+        _fd = STDERR_FILENO;
+    } else if ((_fd = creat(file_name, 0660)) < 0) {
+        _fd = STDOUT_FILENO;
+        warn("Could not open log file: %s", file_name);
+    }
 }
 
 void Log::close() {
-    if (_file != stdout && _file != stderr) {
-        fclose(_file);
-        _file = stdout;
+    MutexLocker ml(_lock);
+    if (_fd > STDERR_FILENO) {
+        ::close(_fd);
+        _fd = STDOUT_FILENO;
+    }
+}
+
+void Log::writeRaw(LogLevel level, const char* msg, size_t len) {
+    MutexLocker ml(_lock);
+    if (level < _level) {
+        return;
+    }
+
+    while (len > 0) {
+        ssize_t bytes = ::write(_fd, msg, len);
+        if (bytes <= 0) {
+            break;
+        }
+        msg += (size_t)bytes;
+        len -= (size_t)bytes;
     }
 }
 
 void Log::log(LogLevel level, const char* msg, va_list args) {
     char buf[1024];
-    size_t len = vsnprintf(buf, sizeof(buf), msg, args);
-    if (len >= sizeof(buf)) {
-        len = sizeof(buf) - 1;
-        buf[len] = 0;
-    }
 
+    // Format log message: [LEVEL] Message\n
+    size_t prefix_len = snprintf(buf, sizeof(buf), "[%s] ", LEVEL_NAME[level]);
+    size_t msg_len = vsnprintf(buf + prefix_len, sizeof(buf) - 1 - prefix_len, msg, args);
+    if (msg_len > sizeof(buf) - 1 - prefix_len) {
+        msg_len = sizeof(buf) - 1 - prefix_len;
+    }
+    buf[prefix_len + msg_len] = '\n';
+
+    // Write all messages to JFR, if active
     if (level < LOG_ERROR) {
-        Profiler::instance()->writeLog(level, buf, len);
+        Profiler::instance()->writeLog(level, buf + prefix_len, msg_len);
     }
 
+    // Write a message with a prefix to a file
     if (level >= _level) {
-        fprintf(_file, "[%s] %s\n", LEVEL_NAME[level], buf);
-        fflush(_file);
+        writeRaw(level, buf, prefix_len + msg_len + 1);
     }
 }
 

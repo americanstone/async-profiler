@@ -1,17 +1,6 @@
 /*
- * Copyright 2022 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef _INCBIN_H
@@ -21,13 +10,13 @@
 #  define INCBIN_SECTION ".const_data"
 #  define INCBIN_SYMBOL  "_"
 #else
-#  define INCBIN_SECTION ".section \".rodata\", \"a\", @progbits"
+#  define INCBIN_SECTION ".section \".rodata\", \"a\""
 #  define INCBIN_SYMBOL
 #endif
 
 #define INCBIN(NAME, FILE) \
-    extern const char NAME[];\
-    extern const char NAME##_END[];\
+    extern "C" const char NAME[];\
+    extern "C" const char NAME##_END[];\
     asm(INCBIN_SECTION "\n"\
         ".global " INCBIN_SYMBOL #NAME "\n"\
         INCBIN_SYMBOL #NAME ":\n"\
@@ -39,5 +28,9 @@
     );
 
 #define INCBIN_SIZEOF(NAME) (NAME##_END - NAME)
+
+#define INCLUDE_HELPER_CLASS(NAME_VAR, DATA_VAR, NAME) \
+    static const char* const NAME_VAR = NAME;\
+    INCBIN(DATA_VAR, "src/helper/" NAME ".class")
 
 #endif // _INCBIN_H

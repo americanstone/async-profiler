@@ -1,17 +1,6 @@
 /*
- * Copyright 2017 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <limits.h>
@@ -23,6 +12,9 @@
 #include <unistd.h>
 #include "arguments.h"
 
+
+// Arguments of the last start/resume command; reused for shutdown and restart
+Arguments _global_args;
 
 // Predefined value that denotes successful operation
 const Error Error::OK(NULL);
@@ -61,16 +53,19 @@ static const Multiplier UNIVERSAL[] = {{'n', 1}, {'u', 1000}, {'m', 1000000}, {'
 //     status           - print profiling status (inactive / running for X seconds)
 //     meminfo          - print profiler memory stats
 //     list             - show the list of available profiling events
-//     version[=full]   - display the agent version
+//     version          - display the agent version
 //     event=EVENT      - which event to trace (cpu, wall, cache-misses, etc.)
 //     alloc[=BYTES]    - profile allocations with BYTES interval
 //     live             - build allocation profile from live objects only
-//     lock[=DURATION]  - profile contended locks longer than DURATION ns
+//     lock[=DURATION]  - profile contended locks overflowing the DURATION ns bucket (default: 10us)
+//     wall[=NS]        - run wall clock profiling together with CPU profiling
+//     nobatch          - legacy wall clock sampling without batch events
 //     collapsed        - dump collapsed stacks (the format used by FlameGraph script)
 //     flamegraph       - produce Flame Graph in HTML format
 //     tree             - produce call tree in HTML format
 //     jfr              - dump events in Java Flight Recorder format
-//     jfrsync[=CONFIG] - start Java Flight Recording with the given config along with the profiler 
+//     jfropts=OPTIONS  - JFR recording options: numeric bitmask or 'mem'
+//     jfrsync[=CONFIG] - start Java Flight Recording with the given config along with the profiler
 //     traces[=N]       - dump top N call traces
 //     flat[=N]         - dump top N methods (aka flat profile)
 //     samples          - count the number of samples (default)
@@ -81,21 +76,25 @@ static const Multiplier UNIVERSAL[] = {{'n', 1}, {'u', 1000}, {'m', 1000000}, {'
 //     loop=TIME        - run profiler in a loop (continuous profiling)
 //     interval=N       - sampling interval in ns (default: 10'000'000, i.e. 10 ms)
 //     jstackdepth=N    - maximum Java stack depth (default: 2048)
+//     signal=N         - use alternative signal for cpu or wall clock profiling
+//     features=LIST    - advanced stack trace features (vtable, comptask, pcaddr)"
 //     safemode=BITS    - disable stack recovery techniques (default: 0, i.e. everything enabled)
 //     file=FILENAME    - output file name for dumping
 //     log=FILENAME     - log warnings and errors to the given dedicated stream
 //     loglevel=LEVEL   - logging level: TRACE, DEBUG, INFO, WARN, ERROR, or NONE
+//     quiet            - do not log "Profiling started/stopped" message
 //     server=ADDRESS   - start insecure HTTP server at ADDRESS/PORT
 //     filter=FILTER    - thread filter
 //     threads          - profile different threads separately
 //     sched            - group threads by scheduling policy
 //     cstack=MODE      - how to collect C stack frames in addition to Java stack
-//                        MODE is 'fp' (Frame Pointer), 'dwarf', 'lbr' (Last Branch Record) or 'no'
-//     allkernel        - include only kernel-mode events
+//                        MODE is 'fp', 'dwarf', 'lbr', 'vm' or 'no'
+//     clock=SOURCE     - clock source for JFR timestamps: 'tsc' or 'monotonic'
 //     alluser          - include only user-mode events
 //     fdtransfer       - use fdtransfer to pass fds to the profiler
 //     simple           - simple class names instead of FQN
 //     dot              - dotted class names
+//     norm             - normalize names of hidden classes / lambdas
 //     sig              - print method signatures
 //     ann              - annotate Java methods
 //     lib              - prepend library names
@@ -104,6 +103,7 @@ static const Multiplier UNIVERSAL[] = {{'n', 1}, {'u', 1000}, {'m', 1000000}, {'
 //     exclude=PATTERN  - exclude stack traces containing PATTERN
 //     begin=FUNCTION   - begin profiling when FUNCTION is executed
 //     end=FUNCTION     - end profiling when FUNCTION is executed
+//     nostop           - do not stop profiling outside --begin/--end window
 //     title=TITLE      - FlameGraph title
 //     minwidth=PCT     - FlameGraph minimum frame width in percent
 //     reverse          - generate stack-reversed FlameGraph / Call tree
@@ -123,7 +123,7 @@ Error Arguments::parse(const char* args) {
     }
     char* args_copy = strcpy(_buf + EXTRA_BUF_SIZE, args);
 
-    const char* msg = NULL;    
+    const char* msg = NULL;
 
     for (char* arg = strtok(args_copy, ","); arg != NULL; arg = strtok(NULL, ",")) {
         char* value = strchr(arg, '=');
@@ -156,7 +156,7 @@ Error Arguments::parse(const char* args) {
                 _action = ACTION_LIST;
 
             CASE("version")
-                _action = value == NULL ? ACTION_VERSION : ACTION_FULL_VERSION;
+                _action = ACTION_VERSION;
 
             // Output formats
             CASE("collapsed")
@@ -170,13 +170,20 @@ Error Arguments::parse(const char* args) {
 
             CASE("jfr")
                 _output = OUTPUT_JFR;
-                if (value != NULL) {
+
+            CASE("jfropts")
+                _output = OUTPUT_JFR;
+                if (value == NULL) {
+                    msg = "Invalid jfropts";
+                } else if (value[0] >= '0' && value[0] <= '9') {
                     _jfr_options = (int)strtol(value, NULL, 0);
+                } else if (strstr(value, "mem")) {
+                    _jfr_options |= IN_MEMORY;
                 }
 
             CASE("jfrsync")
                 _output = OUTPUT_JFR;
-                _jfr_options = JFR_SYNC_OPTS;
+                _jfr_options |= JFR_SYNC_OPTS;
                 _jfr_sync = value == NULL ? "default" : value;
 
             CASE("traces")
@@ -209,8 +216,10 @@ Error Arguments::parse(const char* args) {
                     msg = "event must not be empty";
                 } else if (strcmp(value, EVENT_ALLOC) == 0) {
                     if (_alloc < 0) _alloc = 0;
+                } else if (strcmp(value, EVENT_NATIVEMEM) == 0) {
+                    if (_nativemem < 0) _nativemem = 0;
                 } else if (strcmp(value, EVENT_LOCK) == 0) {
-                    if (_lock < 0) _lock = 0;
+                    if (_lock < 0) _lock = DEFAULT_LOCK_INTERVAL;
                 } else if (_event != NULL) {
                     msg = "Duplicate event argument";
                 } else {
@@ -218,21 +227,34 @@ Error Arguments::parse(const char* args) {
                 }
 
             CASE("timeout")
-                if (value == NULL || (_timeout = parseTimeout(value)) == -1 || !_persistent) {
+                if (value == NULL || (_timeout = parseTimeout(value)) == -1) {
                     msg = "Invalid timeout";
                 }
 
             CASE("loop")
                 _loop = true;
-                if (value == NULL || (_timeout = parseTimeout(value)) == -1 || !_persistent) {
+                if (value == NULL || (_timeout = parseTimeout(value)) == -1) {
                     msg = "Invalid loop duration";
                 }
 
             CASE("alloc")
                 _alloc = value == NULL ? 0 : parseUnits(value, BYTES);
 
+            CASE("nativemem")
+                _nativemem = value == NULL ? 0 : parseUnits(value, BYTES);
+
             CASE("lock")
                 _lock = value == NULL ? 0 : parseUnits(value, NANOS);
+
+            CASE("wall")
+                _wall = value == NULL ? 0 : parseUnits(value, NANOS);
+
+            CASE("cpu")
+                if (_event != NULL) {
+                    msg = "Duplicate event argument";
+                } else {
+                    _event = EVENT_CPU;
+                }
 
             CASE("interval")
                 if (value == NULL || (_interval = parseUnits(value, UNIVERSAL)) <= 0) {
@@ -244,8 +266,33 @@ Error Arguments::parse(const char* args) {
                     msg = "jstackdepth must be > 0";
                 }
 
-            CASE("safemode")
-                _safe_mode = value == NULL ? INT_MAX : (int)strtol(value, NULL, 0);
+            CASE("signal")
+                if (value == NULL || (_signal = atoi(value)) <= 0) {
+                    msg = "signal must be > 0";
+                } else if ((value = strchr(value, '/')) != NULL) {
+                    // Two signals were specified: one for CPU profiling, another for wall clock
+                    _signal |= atoi(value + 1) << 8;
+                }
+
+            CASE("features")
+                if (value != NULL) {
+                    if (strstr(value, "stats"))    _features.stats = 1;
+                    if (strstr(value, "probesp"))  _features.probe_sp = 1;
+                    if (strstr(value, "vtable"))   _features.vtable_target = 1;
+                    if (strstr(value, "comptask")) _features.comp_task = 1;
+                    if (strstr(value, "pcaddr"))   _features.pc_addr = 1;
+                }
+
+            CASE("safemode") {
+                // Left for compatibility purpose; will be eventually migrated to 'features'
+                int bits = value == NULL ? INT_MAX : (int)strtol(value, NULL, 0);
+                _features.unknown_java  = (bits & 1) ? 0 : 1;
+                _features.unwind_stub   = (bits & 2) ? 0 : 1;
+                _features.unwind_comp   = (bits & 4) ? 0 : 1;
+                _features.unwind_native = (bits & 8) ? 0 : 1;
+                _features.java_anchor   = (bits & 16) ? 0 : 1;
+                _features.gc_traces     = (bits & 32) ? 0 : 1;
+            }
 
             CASE("file")
                 if (value == NULL || value[0] == 0) {
@@ -261,6 +308,9 @@ Error Arguments::parse(const char* args) {
                     msg = "loglevel must not be empty";
                 }
                 _loglevel = value;
+
+            CASE("quiet")
+                _quiet = true;
 
             CASE("server")
                 if (value == NULL || value[0] == 0) {
@@ -296,22 +346,35 @@ Error Arguments::parse(const char* args) {
             CASE("live")
                 _live = true;
 
-            CASE("allkernel")
-                _ring = RING_KERNEL;
+            CASE("nobatch")
+                _nobatch = true;
 
             CASE("alluser")
-                _ring = RING_USER;
+                _alluser = true;
 
             CASE("cstack")
                 if (value != NULL) {
-                    if (value[0] == 'n') {
-                        _cstack = CSTACK_NO;
-                    } else if (value[0] == 'd') {
-                        _cstack = CSTACK_DWARF;
-                    } else if (value[0] == 'l') {
-                        _cstack = CSTACK_LBR;
-                    } else {
+                    if (strcmp(value, "fp") == 0) {
                         _cstack = CSTACK_FP;
+                    } else if (strcmp(value, "dwarf") == 0) {
+                        _cstack = CSTACK_DWARF;
+                    } else if (strcmp(value, "lbr") == 0) {
+                        _cstack = CSTACK_LBR;
+                    } else if (strcmp(value, "vm") == 0) {
+                        _cstack = CSTACK_VM;
+                    } else if (strcmp(value, "vmx") == 0) {
+                        _cstack = CSTACK_VMX;
+                    } else {
+                        _cstack = CSTACK_NO;
+                    }
+                }
+
+            CASE("clock")
+                if (value != NULL) {
+                    if (value[0] == 't') {
+                        _clock = CLK_TSC;
+                    } else if (value[0] == 'm') {
+                        _clock = CLK_MONOTONIC;
                     }
                 }
 
@@ -321,6 +384,9 @@ Error Arguments::parse(const char* args) {
 
             CASE("dot")
                 _style |= STYLE_DOTTED;
+
+            CASE("norm")
+                _style |= STYLE_NORMALIZE;
 
             CASE("sig")
                 _style |= STYLE_SIGNATURES;
@@ -339,6 +405,9 @@ Error Arguments::parse(const char* args) {
 
             CASE("end")
                 _end = value;
+
+            CASE("nostop")
+                _nostop = true;
 
             // FlameGraph options
             CASE("title")
@@ -360,7 +429,7 @@ Error Arguments::parse(const char* args) {
         return Error(msg);
     }
 
-    if (_event == NULL && _alloc < 0 && _lock < 0) {
+    if (_event == NULL && _alloc < 0 && _lock < 0 && _wall < 0 && _nativemem < 0) {
         _event = EVENT_CPU;
     }
 
@@ -385,6 +454,11 @@ const char* Arguments::file() {
         return expandFilePattern(_file);
     }
     return _file;
+}
+
+// Returns true if the log file is a temporary file of asprof launcher
+bool Arguments::hasTemporaryLog() const {
+    return _log != NULL && strncmp(_log, "/tmp/asprof-log.", 16) == 0;
 }
 
 // The linked list of string offsets is embedded right into _buf array
@@ -515,8 +589,10 @@ Arguments::~Arguments() {
     if (!_shared) free(_buf);
 }
 
-void Arguments::save(Arguments& other) {
-    if (!_shared) free(_buf);
-    *this = other;
-    other._shared = true;
+void Arguments::save() {
+    if (this != &_global_args) {
+        free(_global_args._buf);
+        _global_args = *this;
+        _shared = true;
+    }
 }

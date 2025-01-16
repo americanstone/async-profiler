@@ -1,17 +1,6 @@
 /*
- * Copyright 2020 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 package one.jfr;
@@ -20,6 +9,7 @@ import one.jfr.event.*;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -40,15 +30,23 @@ public class JfrReader implements Closeable {
     private static final int CHUNK_HEADER_SIZE = 68;
     private static final int CHUNK_SIGNATURE = 0x464c5200;
 
+    private static final byte STATE_NEW_CHUNK = 0;
+    private static final byte STATE_READING = 1;
+    private static final byte STATE_EOF = 2;
+    private static final byte STATE_INCOMPLETE = 3;
+
     private final FileChannel ch;
     private ByteBuffer buf;
+    private final long fileSize;
     private long filePosition;
-    private boolean eof;
-    private boolean incomplete;
+    private byte state;
 
     public long startNanos = Long.MAX_VALUE;
     public long endNanos = Long.MIN_VALUE;
     public long startTicks = Long.MAX_VALUE;
+    public long chunkStartNanos;
+    public long chunkEndNanos;
+    public long chunkStartTicks;
     public long ticksPerSec;
     public boolean stopAtNewChunk;
 
@@ -56,15 +54,18 @@ public class JfrReader implements Closeable {
     public final Map<String, JfrClass> typesByName = new HashMap<>();
     public final Dictionary<String> threads = new Dictionary<>();
     public final Dictionary<ClassRef> classes = new Dictionary<>();
+    public final Dictionary<String> strings = new Dictionary<>();
     public final Dictionary<byte[]> symbols = new Dictionary<>();
     public final Dictionary<MethodRef> methods = new Dictionary<>();
     public final Dictionary<StackTrace> stackTraces = new Dictionary<>();
-    public final Map<Integer, String> frameTypes = new HashMap<>();
-    public final Map<Integer, String> threadStates = new HashMap<>();
     public final Map<String, String> settings = new HashMap<>();
+    public final Map<String, Map<Integer, String>> enums = new HashMap<>();
+
+    private final Dictionary<Constructor<? extends Event>> customEvents = new Dictionary<>();
 
     private int executionSample;
     private int nativeMethodSample;
+    private int wallClockSample;
     private int allocationInNewTLAB;
     private int allocationOutsideTLAB;
     private int allocationSample;
@@ -72,11 +73,13 @@ public class JfrReader implements Closeable {
     private int monitorEnter;
     private int threadPark;
     private int activeSetting;
-    private boolean activeSettingHasStack;
+    private int malloc;
+    private int free;
 
     public JfrReader(String fileName) throws IOException {
         this.ch = FileChannel.open(Paths.get(fileName), StandardOpenOption.READ);
         this.buf = ByteBuffer.allocateDirect(BUFFER_SIZE);
+        this.fileSize = ch.size();
 
         buf.flip();
         ensureBytes(CHUNK_HEADER_SIZE);
@@ -88,6 +91,7 @@ public class JfrReader implements Closeable {
     public JfrReader(ByteBuffer buf) throws IOException {
         this.ch = null;
         this.buf = buf;
+        this.fileSize = buf.limit();
 
         buf.order(ByteOrder.BIG_ENDIAN);
         if (!readChunk(0)) {
@@ -97,23 +101,37 @@ public class JfrReader implements Closeable {
 
     @Override
     public void close() throws IOException {
-        ch.close();
+        if (ch != null) {
+            ch.close();
+        }
     }
 
     public boolean eof() {
-        return eof;
+        return state >= STATE_EOF;
     }
 
     public boolean incomplete() {
-        return incomplete;
+        return state == STATE_INCOMPLETE;
     }
 
     public long durationNanos() {
         return endNanos - startNanos;
     }
 
-    public long nanosToTicks(long nanos) {
-        return (long) ((nanos - startNanos) * (ticksPerSec / 1e9)) + startTicks;
+    public <E extends Event> void registerEvent(String name, Class<E> eventClass) {
+        JfrClass type = typesByName.get(name);
+        if (type != null) {
+            try {
+                customEvents.put(type.id, eventClass.getConstructor(JfrReader.class));
+            } catch (NoSuchMethodException e) {
+                throw new IllegalArgumentException("No suitable constructor found");
+            }
+        }
+    }
+
+    // Similar to eof(), but parses the next chunk header
+    public boolean hasMoreChunks() throws IOException {
+        return state == STATE_NEW_CHUNK ? readChunk(buf.position()) : state == STATE_READING;
     }
 
     public List<Event> readAllEvents() throws IOException {
@@ -141,18 +159,27 @@ public class JfrReader implements Closeable {
             int type = getVarint();
 
             if (type == 'L' && buf.getInt(pos) == CHUNK_SIGNATURE) {
-                if (readChunk(pos) && !stopAtNewChunk) {
+                if (state != STATE_NEW_CHUNK && stopAtNewChunk) {
+                    buf.position(pos);
+                    state = STATE_NEW_CHUNK;
+                } else if (readChunk(pos)) {
                     continue;
                 }
                 return null;
             }
 
             if (type == executionSample || type == nativeMethodSample) {
-                if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample();
+                if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample(false);
+            } else if (type == wallClockSample) {
+                if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample(true);
             } else if (type == allocationInNewTLAB) {
                 if (cls == null || cls == AllocationSample.class) return (E) readAllocationSample(true);
             } else if (type == allocationOutsideTLAB || type == allocationSample) {
                 if (cls == null || cls == AllocationSample.class) return (E) readAllocationSample(false);
+            } else if (type == malloc) {
+                if (cls == null || cls == MallocEvent.class) return (E) readMallocEvent(true);
+            } else if (type == free) {
+                if (cls == null || cls == MallocEvent.class) return (E) readMallocEvent(false);
             } else if (type == liveObject) {
                 if (cls == null || cls == LiveObject.class) return (E) readLiveObject();
             } else if (type == monitorEnter) {
@@ -161,21 +188,33 @@ public class JfrReader implements Closeable {
                 if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(true);
             } else if (type == activeSetting) {
                 readActiveSetting();
+            } else {
+                Constructor<? extends Event> customEvent = customEvents.get(type);
+                if (customEvent != null && (cls == null || cls == customEvent.getDeclaringClass())) {
+                    try {
+                        return (E) customEvent.newInstance(this);
+                    } catch (ReflectiveOperationException e) {
+                        throw new IllegalStateException(e);
+                    } finally {
+                        seek(filePosition + pos + size);
+                    }
+                }
             }
 
             seek(filePosition + pos + size);
         }
 
-        eof = true;
+        state = STATE_EOF;
         return null;
     }
 
-    private ExecutionSample readExecutionSample() {
+    private ExecutionSample readExecutionSample(boolean hasSamples) {
         long time = getVarlong();
         int tid = getVarint();
         int stackTraceId = getVarint();
         int threadState = getVarint();
-        return new ExecutionSample(time, tid, stackTraceId, threadState);
+        int samples = hasSamples ? getVarint() : 1;
+        return new ExecutionSample(time, tid, stackTraceId, threadState, samples);
     }
 
     private AllocationSample readAllocationSample(boolean tlab) {
@@ -186,6 +225,15 @@ public class JfrReader implements Closeable {
         long allocationSize = getVarlong();
         long tlabSize = tlab ? getVarlong() : 0;
         return new AllocationSample(time, tid, stackTraceId, classId, allocationSize, tlabSize);
+    }
+
+    private MallocEvent readMallocEvent(boolean hasSize) {
+        long time = getVarlong();
+        int tid = getVarint();
+        int stackTraceId = getVarint();
+        long address = getVarlong();
+        long size = hasSize ? getVarlong() : 0;
+        return new MallocEvent(time, tid, stackTraceId, address, size);
     }
 
     private LiveObject readLiveObject() {
@@ -211,11 +259,12 @@ public class JfrReader implements Closeable {
     }
 
     private void readActiveSetting() {
-        long time = getVarlong();
-        long duration = getVarlong();
-        int tid = getVarint();
-        if (activeSettingHasStack) getVarint();
-        long id = getVarlong();
+        for (JfrField field : typesByName.get("jdk.ActiveSetting").fields) {
+            getVarlong();
+            if ("id".equals(field.name)) {
+                break;
+            }
+        }
         String name = getString();
         String value = getString();
         settings.put(name, value);
@@ -231,27 +280,38 @@ public class JfrReader implements Closeable {
             throw new IOException("Unsupported JFR version: " + (version >>> 16) + "." + (version & 0xffff));
         }
 
-        long cpOffset = buf.getLong(pos + 16);
-        long metaOffset = buf.getLong(pos + 24);
-        if (cpOffset == 0 || metaOffset == 0) {
-            eof = incomplete = true;
+        long chunkStart = filePosition + pos;
+        long chunkSize = buf.getLong(pos + 8);
+        if (chunkStart + chunkSize > fileSize) {
+            state = STATE_INCOMPLETE;
             return false;
         }
 
-        startNanos = Math.min(startNanos, buf.getLong(pos + 32));
-        endNanos = Math.max(endNanos, buf.getLong(pos + 32) + buf.getLong(pos + 40));
-        startTicks = Math.min(startTicks, buf.getLong(pos + 48));
+        long cpOffset = buf.getLong(pos + 16);
+        long metaOffset = buf.getLong(pos + 24);
+        if (cpOffset == 0 || metaOffset == 0) {
+            state = STATE_INCOMPLETE;
+            return false;
+        }
+
+        chunkStartNanos = buf.getLong(pos + 32);
+        chunkEndNanos = buf.getLong(pos + 32) + buf.getLong(pos + 40);
+        chunkStartTicks = buf.getLong(pos + 48);
         ticksPerSec = buf.getLong(pos + 56);
+
+        startNanos = Math.min(startNanos, chunkStartNanos);
+        endNanos = Math.max(endNanos, chunkEndNanos);
+        startTicks = Math.min(startTicks, chunkStartTicks);
 
         types.clear();
         typesByName.clear();
 
-        long chunkStart = filePosition + pos;
         readMeta(chunkStart + metaOffset);
         readConstantPool(chunkStart + cpOffset);
         cacheEventTypes();
 
         seek(chunkStart + CHUNK_HEADER_SIZE);
+        state = STATE_READING;
         return true;
     }
 
@@ -340,6 +400,9 @@ public class JfrReader implements Closeable {
             case "java.lang.Class":
                 readClasses(type.fields.size());
                 break;
+            case "java.lang.String":
+                readStrings();
+                break;
             case "jdk.types.Symbol":
                 readSymbols();
                 break;
@@ -349,14 +412,12 @@ public class JfrReader implements Closeable {
             case "jdk.types.StackTrace":
                 readStackTraces();
                 break;
-            case "jdk.types.FrameType":
-                readMap(frameTypes);
-                break;
-            case "jdk.types.ThreadState":
-                readMap(threadStates);
-                break;
             default:
-                readOtherConstants(type.fields);
+                if (type.simpleType && type.fields.size() == 1) {
+                    readEnumValues(type.name);
+                } else {
+                    readOtherConstants(type.fields);
+                }
         }
     }
 
@@ -424,6 +485,13 @@ public class JfrReader implements Closeable {
         return new StackTrace(methods, types, locations);
     }
 
+    private void readStrings() {
+        int count = strings.preallocate(getVarint());
+        for (int i = 0; i < count; i++) {
+            strings.put(getVarlong(), getString());
+        }
+    }
+
     private void readSymbols() {
         int count = symbols.preallocate(getVarint());
         for (int i = 0; i < count; i++) {
@@ -435,11 +503,13 @@ public class JfrReader implements Closeable {
         }
     }
 
-    private void readMap(Map<Integer, String> map) {
+    private void readEnumValues(String typeName) {
+        HashMap<Integer, String> map = new HashMap<>();
         int count = getVarint();
         for (int i = 0; i < count; i++) {
-            map.put(getVarint(), getString());
+            map.put((int) getVarlong(), getString());
         }
+        enums.put(typeName, map);
     }
 
     private void readOtherConstants(List<JfrField> fields) {
@@ -477,6 +547,7 @@ public class JfrReader implements Closeable {
     private void cacheEventTypes() {
         executionSample = getTypeId("jdk.ExecutionSample");
         nativeMethodSample = getTypeId("jdk.NativeMethodSample");
+        wallClockSample = getTypeId("profiler.WallClockSample");
         allocationInNewTLAB = getTypeId("jdk.ObjectAllocationInNewTLAB");
         allocationOutsideTLAB = getTypeId("jdk.ObjectAllocationOutsideTLAB");
         allocationSample = getTypeId("jdk.ObjectAllocationSample");
@@ -484,7 +555,13 @@ public class JfrReader implements Closeable {
         monitorEnter = getTypeId("jdk.JavaMonitorEnter");
         threadPark = getTypeId("jdk.ThreadPark");
         activeSetting = getTypeId("jdk.ActiveSetting");
-        activeSettingHasStack = activeSetting >= 0 && typesByName.get("jdk.ActiveSetting").field("stackTrace") != null;
+        malloc = getTypeId("profiler.Malloc");
+        free = getTypeId("profiler.Free");
+
+        registerEvent("jdk.CPULoad", CPULoad.class);
+        registerEvent("jdk.GCHeapSummary", GCHeapSummary.class);
+        registerEvent("jdk.ObjectCount", ObjectCount.class);
+        registerEvent("jdk.ObjectCountAfterGC", ObjectCount.class);
     }
 
     private int getTypeId(String typeName) {
@@ -492,7 +569,23 @@ public class JfrReader implements Closeable {
         return type != null ? type.id : -1;
     }
 
-    private int getVarint() {
+    public int getEnumKey(String typeName, String value) {
+        Map<Integer, String> enumValues = enums.get(typeName);
+        if (enumValues != null) {
+            for (Map.Entry<Integer, String> entry : enumValues.entrySet()) {
+                if (value.equals(entry.getValue())) {
+                    return entry.getKey();
+                }
+            }
+        }
+        return -1;
+    }
+
+    public String getEnumValue(String typeName, int key) {
+        return enums.get(typeName).get(key);
+    }
+
+    public int getVarint() {
         int result = 0;
         for (int shift = 0; ; shift += 7) {
             byte b = buf.get();
@@ -503,7 +596,7 @@ public class JfrReader implements Closeable {
         }
     }
 
-    private long getVarlong() {
+    public long getVarlong() {
         long result = 0;
         for (int shift = 0; shift < 56; shift += 7) {
             byte b = buf.get();
@@ -515,12 +608,22 @@ public class JfrReader implements Closeable {
         return result | (buf.get() & 0xffL) << 56;
     }
 
-    private String getString() {
+    public float getFloat() {
+        return buf.getFloat();
+    }
+
+    public double getDouble() {
+        return buf.getDouble();
+    }
+
+    public String getString() {
         switch (buf.get()) {
             case 0:
                 return null;
             case 1:
                 return "";
+            case 2:
+                return strings.get(getVarlong());
             case 3:
                 return new String(getBytes(), StandardCharsets.UTF_8);
             case 4: {
@@ -537,7 +640,7 @@ public class JfrReader implements Closeable {
         }
     }
 
-    private byte[] getBytes() {
+    public byte[] getBytes() {
         byte[] bytes = new byte[getVarint()];
         buf.get(bytes);
         return bytes;

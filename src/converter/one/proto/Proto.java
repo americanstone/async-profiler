@@ -1,21 +1,11 @@
 /*
- * Copyright 2020 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 package one.proto;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /**
@@ -62,7 +52,8 @@ public class Proto {
 
     public Proto field(int index, String s) {
         tag(index, 2);
-        writeString(s);
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        writeBytes(bytes, 0, bytes.length);
         return this;
     }
 
@@ -78,11 +69,28 @@ public class Proto {
         return this;
     }
 
+    public int startField(int index) {
+        tag(index, 2);
+        ensureCapacity(3);
+        return pos += 3;
+    }
+
+    public void commitField(int mark) {
+        int length = pos - mark;
+        if (length >= 1 << (7 * 3)) {
+            throw new IllegalArgumentException("Field too large");
+        }
+
+        buf[mark - 3] = (byte) (0x80 | (length & 0x7f));
+        buf[mark - 2] = (byte) (0x80 | ((length >>> 7) & 0x7f));
+        buf[mark - 1] = (byte) (length >>> 14);
+    }
+
     public void writeInt(int n) {
         int length = n == 0 ? 1 : (38 - Integer.numberOfLeadingZeros(n)) / 7;
         ensureCapacity(length);
 
-        while (n > 0x7f) {
+        while ((n >>> 7) != 0) {
             buf[pos++] = (byte) (0x80 | (n & 0x7f));
             n >>>= 7;
         }
@@ -93,7 +101,7 @@ public class Proto {
         int length = n == 0 ? 1 : (70 - Long.numberOfLeadingZeros(n)) / 7;
         ensureCapacity(length);
 
-        while (n > 0x7f) {
+        while ((n >>> 7) != 0) {
             buf[pos++] = (byte) (0x80 | (n & 0x7f));
             n >>>= 7;
         }
@@ -114,16 +122,6 @@ public class Proto {
         pos += 8;
     }
 
-    public void writeString(String s) {
-        int length = s.length();
-        writeInt(length);
-        ensureCapacity(length);
-
-        for (int i = 0; i < length; i++) {
-            buf[pos++] = (byte) s.charAt(i);
-        }
-    }
-
     public void writeBytes(byte[] bytes, int offset, int length) {
         writeInt(length);
         ensureCapacity(length);
@@ -138,7 +136,8 @@ public class Proto {
 
     private void ensureCapacity(int length) {
         if (pos + length > buf.length) {
-            buf = Arrays.copyOf(buf, Math.max(pos + length, buf.length * 2));
+            int newLength = buf.length * 2;
+            buf = Arrays.copyOf(buf, newLength < 0 ? 0x7ffffff0 : Math.max(newLength, pos + length));
         }
     }
 }

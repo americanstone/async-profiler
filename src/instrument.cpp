@@ -1,17 +1,6 @@
 /*
- * Copyright 2019 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <arpa/inet.h>
@@ -19,13 +8,13 @@
 #include <string.h>
 #include "arch.h"
 #include "incbin.h"
-#include "os.h"
 #include "profiler.h"
+#include "tsc.h"
 #include "vmEntry.h"
 #include "instrument.h"
 
 
-INCBIN(INSTRUMENT_CLASS, "one/profiler/Instrument.class")
+INCLUDE_HELPER_CLASS(INSTRUMENT_NAME, INSTRUMENT_CLASS, "one/profiler/Instrument")
 
 
 enum ConstantTag {
@@ -511,10 +500,14 @@ volatile bool Instrument::_running;
 
 Error Instrument::check(Arguments& args) {
     if (!_instrument_class_loaded) {
+        if (!VM::loaded()) {
+            return Error("Profiling event is not supported with non-Java processes");
+        }
+
         JNIEnv* jni = VM::jni();
         const JNINativeMethod native_method = {(char*)"recordSample", (char*)"()V", (void*)recordSample};
 
-        jclass cls = jni->DefineClass(NULL, NULL, (const jbyte*)INSTRUMENT_CLASS, INCBIN_SIZEOF(INSTRUMENT_CLASS));
+        jclass cls = jni->DefineClass(INSTRUMENT_NAME, NULL, (const jbyte*)INSTRUMENT_CLASS, INCBIN_SIZEOF(INSTRUMENT_CLASS));
         if (cls == NULL || jni->RegisterNatives(cls, &native_method, 1) != 0) {
             jni->ExceptionDescribe();
             return Error("Could not load Instrument class");
@@ -614,7 +607,7 @@ void JNICALL Instrument::recordSample(JNIEnv* jni, jobject unused) {
     if (!_enabled) return;
 
     if (_interval <= 1 || ((atomicInc(_calls) + 1) % _interval) == 0) {
-        ExecutionEvent event;
-        Profiler::instance()->recordSample(NULL, _interval, BCI_INSTRUMENT, &event);
+        ExecutionEvent event(TSC::ticks());
+        Profiler::instance()->recordSample(NULL, _interval, INSTRUMENTED_METHOD, &event);
     }
 }

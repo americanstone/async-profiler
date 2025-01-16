@@ -1,23 +1,13 @@
 /*
- * Copyright 2021 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdlib.h>
 #include "j9WallClock.h"
 #include "j9Ext.h"
 #include "profiler.h"
+#include "tsc.h"
 
 
 long J9WallClock::_interval;
@@ -59,6 +49,7 @@ void J9WallClock::timerLoop() {
         jvmtiStackInfoExtended* stack_infos;
         jint thread_count;
         if (J9Ext::GetAllStackTracesExtended(_max_stack_depth, (void**)&stack_infos, &thread_count) == 0) {
+            u64 start_time = TSC::ticks();
             for (int i = 0; i < thread_count; i++) {
                 jvmtiStackInfoExtended* si = &stack_infos[i];
                 for (int j = 0; j < si->frame_count; j++) {
@@ -68,9 +59,9 @@ void J9WallClock::timerLoop() {
                 }
 
                 int tid = J9Ext::GetOSThreadID(si->thread);
-                ExecutionEvent event;
+                ExecutionEvent event(start_time);
                 event._thread_state = (si->state & JVMTI_THREAD_STATE_RUNNABLE) ? THREAD_RUNNING : THREAD_SLEEPING;
-                Profiler::instance()->recordExternalSample(_interval, tid, 0, &event, si->frame_count, frames);
+                Profiler::instance()->recordExternalSample(_interval, tid, EXECUTION_SAMPLE, &event, si->frame_count, frames);
             }
             jvmti->Deallocate((unsigned char*)stack_infos);
         }

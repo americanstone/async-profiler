@@ -2,8 +2,8 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <groupId>tools.profiler</groupId>
-    <artifactId>async-profiler-converter</artifactId>
-    <version>2.9</version>
+    <artifactId>jfr-converter</artifactId>
+    <version>3.0</version>
     <packaging>jar</packaging>
 
     <name>async-profiler</name>
@@ -18,9 +18,9 @@
         </license>
     </licenses>
     <scm>
-        <url>https://github.com/jvm-profiling-tools/async-profiler</url>
-        <connection>scm:git:git@github.com:jvm-profiling-tools/async-profiler.git</connection>
-        <developerConnection>scm:git:git@github.com:jvm-profiling-tools/async-profiler.git</developerConnection>
+        <url>https://github.com/async-profiler/async-profiler</url>
+        <connection>scm:git:git@github.com:async-profiler/async-profiler.git</connection>
+        <developerConnection>scm:git:git@github.com:async-profiler/async-profiler.git</developerConnection>
     </scm>
     <developers>
         <developer>
@@ -47,8 +47,7 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.8.1</version>
                 <configuration>
-                    <source>7</source>
-                    <target>7</target>
+                    <release>8</release>
                 </configuration>
             </plugin>
             <plugin>

@@ -1,20 +1,11 @@
 /*
- * Copyright 2020 Andrei Pangin
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Copyright The async-profiler authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 package one.jfr;
+
+import java.util.Arrays;
 
 /**
  * Fast and compact long->Object map.
@@ -27,13 +18,17 @@ public class Dictionary<T> {
     private int size;
 
     public Dictionary() {
-        this.keys = new long[INITIAL_CAPACITY];
-        this.values = new Object[INITIAL_CAPACITY];
+        this(INITIAL_CAPACITY);
+    }
+
+    public Dictionary(int initialCapacity) {
+        this.keys = new long[initialCapacity];
+        this.values = new Object[initialCapacity];
     }
 
     public void clear() {
-        keys = new long[INITIAL_CAPACITY];
-        values = new Object[INITIAL_CAPACITY];
+        Arrays.fill(keys, 0);
+        Arrays.fill(values, null);
         size = 0;
     }
 
